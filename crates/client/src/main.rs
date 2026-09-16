@@ -1,15 +1,14 @@
 use winit::application::ApplicationHandler;
 use winit::event_loop::{EventLoop, ActiveEventLoop};
 use winit::window::{Window, WindowId};
-use winit::event::WindowEvent;
+use winit::event::{WindowEvent, MouseButton, ElementState};
 use std::sync::Arc;
 
 struct App {
-    // IMPORTANT: renderer MUST be declared before window so it drops first.
-    // The GPU surface needs the window alive during cleanup.
     renderer: Option<renderer::Renderer>,
     window: Option<Arc<Window>>,
     ui: ui::UI,
+    cursor_pos: (f64, f64),
 }
 
 impl ApplicationHandler for App {
@@ -36,7 +35,6 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                // Explicitly drop GPU resources before the window and event loop
                 self.renderer = None;
                 self.window = None;
                 event_loop.exit();
@@ -48,6 +46,17 @@ impl ApplicationHandler for App {
                     let safe_h = size.height.max(1) as f32;
                     self.ui.layout(safe_w, safe_h);
                 }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.cursor_pos;
+                self.ui.handle_click(x as f32, y as f32);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(rend) = self.renderer.as_mut() {
@@ -75,6 +84,7 @@ fn main() {
         renderer: None,
         window: None,
         ui: ui::UI::new(),
+        cursor_pos: (0.0, 0.0),
     };
     event_loop.run_app(&mut app).unwrap();
 }
