@@ -11,11 +11,13 @@ const LIGHT: [f32; 3] = [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0];
 const DARK: [f32; 3] = [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0];
 const SELECTED: [f32; 3] = [106.0 / 255.0, 170.0 / 255.0, 100.0 / 255.0];
 const TARGET: [f32; 3] = [0.30, 0.55, 0.85];
+const CHECK: [f32; 3] = [0.85, 0.25, 0.25];
 
 pub struct UI {
     pub squares: Vec<Rect>,
     selected: Option<chess::Square>,
     move_targets: Vec<chess::Square>,
+    checked_king: Option<chess::Square>,
     board_px: f32,
     sq_size: f32,
     offset_x: f32,
@@ -28,6 +30,7 @@ impl UI {
             squares: Vec::with_capacity(64),
             selected: None,
             move_targets: Vec::new(),
+            checked_king: None,
             board_px: 0.0,
             sq_size: 0.0,
             offset_x: 0.0,
@@ -67,7 +70,9 @@ impl UI {
             let col = i % 8;
             let base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
             let sq = Self::square_at_index(i);
-            rect.color = if self.selected == Some(sq) {
+            rect.color = if self.checked_king == Some(sq) {
+                CHECK
+            } else if self.selected == Some(sq) {
                 SELECTED
             } else if self.move_targets.contains(&sq) {
                 TARGET
@@ -77,14 +82,12 @@ impl UI {
         }
     }
 
-    /// Screen index -> chess square (row 0 is the top of the screen = rank 8).
     fn square_at_index(i: usize) -> chess::Square {
         let row = i / 8;
         let col = i % 8;
         chess::Square::from_file_rank(col as u8, (7 - row) as u8).unwrap()
     }
 
-    /// Map a physical-pixel position to a chess square.
     pub fn square_at(&self, x: f32, y: f32) -> Option<chess::Square> {
         let bx = x - self.offset_x;
         let by = y - self.offset_y;
@@ -108,6 +111,11 @@ impl UI {
     pub fn clear_selection(&mut self) {
         self.selected = None;
         self.move_targets.clear();
+        self.apply_colors();
+    }
+
+    pub fn set_checked_king(&mut self, sq: Option<chess::Square>) {
+        self.checked_king = sq;
         self.apply_colors();
     }
 

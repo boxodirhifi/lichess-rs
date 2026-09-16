@@ -8,6 +8,13 @@ pub struct Move {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameStatus {
+    Ongoing,
+    Checkmate(Color), // the winner
+    Stalemate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CastlingRights {
     pub white_kingside: bool,
     pub white_queenside: bool,
@@ -119,6 +126,22 @@ impl Board {
                 !copy.in_check(piece.color)
             })
             .collect()
+    }
+
+    pub fn has_legal_moves(&self, color: Color) -> bool {
+        self.iter().any(|(sq, piece)| {
+            piece.color == color && !self.legal_moves_from(sq).is_empty()
+        })
+    }
+
+    pub fn status(&self, side_to_move: Color) -> GameStatus {
+        if self.has_legal_moves(side_to_move) {
+            GameStatus::Ongoing
+        } else if self.in_check(side_to_move) {
+            GameStatus::Checkmate(side_to_move.opposite())
+        } else {
+            GameStatus::Stalemate
+        }
     }
 
     pub fn make_move(&mut self, mv: Move) {
@@ -658,5 +681,25 @@ mod tests {
         let c6 = Square::from_file_rank(2, 5).unwrap();
         let dests: Vec<Square> = board.legal_moves_from(b5).iter().map(|m| m.to).collect();
         assert!(!dests.contains(&c6));
+    }
+    #[test]
+    fn detects_checkmate() {
+        // Fool's mate: white to move is checkmated by the black queen on h4.
+        let board = Board::from_fen(
+            "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+        ).unwrap();
+        assert_eq!(board.status(Color::White), GameStatus::Checkmate(Color::Black));
+    }
+
+    #[test]
+    fn detects_stalemate() {
+        // Black king h8 is not in check but has no legal move.
+        let board = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert_eq!(board.status(Color::Black), GameStatus::Stalemate);
+    }
+
+    #[test]
+    fn starting_position_is_ongoing() {
+        assert_eq!(Board::starting_position().status(Color::White), GameStatus::Ongoing);
     }
 }

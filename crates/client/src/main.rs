@@ -10,11 +10,26 @@ struct App {
     ui: ui::UI,
     board: chess::Board,
     side: chess::Color,
+    status: chess::GameStatus,
     cursor_pos: (f64, f64),
 }
 
 impl App {
+    fn refresh_check_highlight(&mut self) {
+        let checked = if self.board.in_check(self.side) {
+            self.board.king_square(self.side)
+        } else {
+            None
+        };
+        self.ui.set_checked_king(checked);
+    }
+
     fn handle_board_click(&mut self, x: f32, y: f32) {
+        // No interaction once the game is over.
+        if self.status != chess::GameStatus::Ongoing {
+            return;
+        }
+
         let sq = match self.ui.square_at(x, y) {
             Some(sq) => sq,
             None => {
@@ -29,6 +44,8 @@ impl App {
                 if let Some(mv) = self.board.legal_moves_from(from).into_iter().find(|m| m.to == sq) {
                     self.board.make_move(mv);
                     self.side = self.side.opposite();
+                    self.status = self.board.status(self.side);
+                    self.refresh_check_highlight();
                 }
             }
             self.ui.clear_selection();
@@ -114,6 +131,7 @@ fn main() {
         ui: ui::UI::new(),
         board: chess::Board::starting_position(),
         side: chess::Color::White,
+        status: chess::GameStatus::Ongoing,
         cursor_pos: (0.0, 0.0),
     };
     event_loop.run_app(&mut app).unwrap();
