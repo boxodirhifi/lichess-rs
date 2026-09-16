@@ -26,7 +26,7 @@ impl App {
         // Clicking a legal destination makes the move.
         if self.ui.is_move_target(sq) {
             if let Some(from) = self.ui.selected_square() {
-                if let Some(mv) = self.board.moves_from(from).into_iter().find(|m| m.to == sq) {
+                if let Some(mv) = self.board.legal_moves_from(from).into_iter().find(|m| m.to == sq) {
                     self.board.make_move(mv);
                     self.side = self.side.opposite();
                 }
@@ -39,7 +39,7 @@ impl App {
         if let Some(piece) = self.board.piece_at(sq) {
             if piece.color == self.side {
                 let mut targets: Vec<chess::Square> =
-                    self.board.moves_from(sq).iter().map(|m| m.to).collect();
+                    self.board.legal_moves_from(sq).iter().map(|m| m.to).collect();
                 targets.sort_by_key(|s| s.index());
                 targets.dedup();
                 self.ui.select(sq, targets);

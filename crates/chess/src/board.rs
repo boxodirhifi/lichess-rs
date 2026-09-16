@@ -82,6 +82,122 @@ impl Board {
         self.set_piece(mv.to, Some(placed));
     }
 
+    /// Fully legal moves for the piece on `from` — excludes moves that leave
+    /// the moving side's king in check.
+    pub fn legal_moves_from(&self, from: Square) -> Vec<Move> {
+        let piece = match self.piece_at(from) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        self.moves_from(from)
+            .into_iter()
+            .filter(|mv| {
+                let mut copy = self.clone();
+                copy.make_move(*mv);
+                !copy.in_check(piece.color)
+            })
+            .collect()
+    }
+
+    pub fn in_check(&self, color: Color) -> bool {
+        let king = match self.king_square(color) {
+            Some(sq) => sq,
+            None => return false,
+        };
+        self.is_square_attacked(king, color.opposite())
+    }
+
+    pub fn king_square(&self, color: Color) -> Option<Square> {
+        self.iter().find_map(|(sq, piece)| {
+            if piece.kind == PieceKind::King && piece.color == color {
+                Some(sq)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Is `square` attacked by any piece of color `by`?
+    pub fn is_square_attacked(&self, square: Square, by: Color) -> bool {
+        let file = square.file() as i32;
+        let rank = square.rank() as i32;
+
+        // Pawn attacks: a pawn of `by` attacks diagonally "forward" from its side.
+        let pawn_dir: i32 = match by {
+            Color::White => 1,
+            Color::Black => -1,
+        };
+        for df in [-1i32, 1i32] {
+            let pf = file + df;
+            let pr = rank - pawn_dir;
+            if (0..8).contains(&pf) && (0..8).contains(&pr) {
+                let sq = Square::from_file_rank(pf as u8, pr as u8).unwrap();
+                if let Some(p) = self.piece_at(sq) {
+                    if p.color == by && p.kind == PieceKind::Pawn {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Knight attacks
+        for &(df, dr) in KNIGHT_DELTAS.iter() {
+            let nf = file + df;
+            let nr = rank + dr;
+            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                let sq = Square::from_file_rank(nf as u8, nr as u8).unwrap();
+                if let Some(p) = self.piece_at(sq) {
+                    if p.color == by && p.kind == PieceKind::Knight {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // King attacks
+        for &(df, dr) in KING_DELTAS.iter() {
+            let nf = file + df;
+            let nr = rank + dr;
+            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                let sq = Square::from_file_rank(nf as u8, nr as u8).unwrap();
+                if let Some(p) = self.piece_at(sq) {
+                    if p.color == by && p.kind == PieceKind::King {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Sliding attacks: rook/queen on orthogonal rays
+        for &(df, dr) in ROOK_DIRS.iter() {
+            if self.slide_attacks(square, by, df, dr, &[PieceKind::Rook, PieceKind::Queen]) {
+                return true;
+            }
+        }
+        // Sliding attacks: bishop/queen on diagonal rays
+        for &(df, dr) in BISHOP_DIRS.iter() {
+            if self.slide_attacks(square, by, df, dr, &[PieceKind::Bishop, PieceKind::Queen]) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn slide_attacks(&self, from: Square, by: Color, df: i32, dr: i32, kinds: &[PieceKind]) -> bool {
+        let mut nf = from.file() as i32 + df;
+        let mut nr = from.rank() as i32 + dr;
+        while (0..8).contains(&nf) && (0..8).contains(&nr) {
+            let sq = Square::from_file_rank(nf as u8, nr as u8).unwrap();
+            if let Some(p) = self.piece_at(sq) {
+                return p.color == by && kinds.contains(&p.kind);
+            }
+            nf += df;
+            nr += dr;
+        }
+        false
+    }
+
     fn pawn_moves(&self, from: Square, color: Color, moves: &mut Vec<Move>) {
         let dir: i32 = match color {
             Color::White => 1,
@@ -225,6 +341,38 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_piece_cannot_leave_pin_line() {
+        // Black rook e8 pins white rook e4 to white king e1 along the e-file.
+        // The rook is free to move along the e-file (e2, e3, e5, e6, e7, exd8... e8 capture)
+        // but any lateral move exposes the king to check and must be illegal.
+        let board = Board::from_fen("4r2k/8/8/8/4R3/8/8/4K3").unwrap();
+        let e4 = Square::from_file_rank(4, 3).unwrap();
+        let legal = board.legal_moves_from(e4);
+        assert_eq!(legal.len(), 6);
+        for mv in &legal {
+            assert_eq!(mv.to.file(), 4); // must stay on the e-file
+        }
+    }
+
+    #[test]
+    fn detects_check() {
+        let board = Board::from_fen("4r2k/8/8/8/8/8/8/4K3").unwrap();
+        assert!(board.in_check(Color::White)); // e-file rook hits e1 king
+        assert!(!board.in_check(Color::Black));
+    }
+
+    #[test]
+    fn king_cannot_move_into_check() {
+        let board = Board::from_fen("4r2k/8/8/8/8/8/8/4K3").unwrap();
+        let e1 = Square::from_file_rank(4, 0).unwrap();
+        let legal = board.legal_moves_from(e1);
+        assert_eq!(legal.len(), 4); // d1, f1, d2, f2
+        for mv in &legal {
+            assert_ne!(mv.to.file(), 4); // can't stay on the attacked e-file
+        }
+    }
 
     #[test]
     fn starting_position_has_32_pieces() {
