@@ -1,16 +1,30 @@
 use winit::application::ApplicationHandler;
-use winit::event_loop::{EventLoop, ActiveEventLoop};
 use winit::window::{Window, WindowId};
-use winit::event::{WindowEvent, MouseButton, ElementState};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub enum NetEvent {
+    LiveGame { game_id: String, moves: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Local,
+    Live,
+}
 
 struct App {
     renderer: Option<renderer::Renderer>,
     window: Option<Arc<Window>>,
     ui: ui::UI,
     board: chess::Board,
+    live_board: Option<chess::Board>,
     side: chess::Color,
     status: chess::GameStatus,
+    mode: Mode,
     cursor_pos: (f64, f64),
 }
 
@@ -25,7 +39,9 @@ impl App {
     }
 
     fn handle_board_click(&mut self, x: f32, y: f32) {
-        // No interaction once the game is over.
+        if self.mode == Mode::Live {
+            return; // spectating only
+        }
         if self.status != chess::GameStatus::Ongoing {
             return;
         }
@@ -38,7 +54,6 @@ impl App {
             }
         };
 
-        // Clicking a legal destination makes the move.
         if self.ui.is_move_target(sq) {
             if let Some(from) = self.ui.selected_square() {
                 if let Some(mv) = self.board.legal_moves_from(from).into_iter().find(|m| m.to == sq) {
@@ -52,7 +67,6 @@ impl App {
             return;
         }
 
-        // Otherwise select one of our own pieces.
         if let Some(piece) = self.board.piece_at(sq) {
             if piece.color == self.side {
                 let mut targets: Vec<chess::Square> =
@@ -67,7 +81,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<NetEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = platform::create_window_attrs();
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
@@ -78,6 +92,16 @@ impl ApplicationHandler for App {
         let rend = pollster::block_on(renderer::Renderer::new(window.clone()));
         self.window = Some(window);
         self.renderer = Some(rend);
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
+        match event {
+            NetEvent::LiveGame { game_id: _, moves } => {
+                let board = chess::Board::starting_position()
+                    .apply_san_moves(&moves, chess::Color::White);
+                self.live_board = Some(board);
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -100,22 +124,48 @@ impl ApplicationHandler for App {
                 let (x, y) = self.cursor_pos;
                 self.handle_board_click(x as f32, y as f32);
             }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state: ElementState::Pressed,
+                    ..
+                },
+                ..
+            } => match code {
+                KeyCode::KeyL => {
+                    self.mode = Mode::Live;
+                    self.ui.clear_selection();
+                    self.ui.set_checked_king(None);
+                }
+                KeyCode::KeyP => {
+                    self.mode = Mode::Local;
+                    self.refresh_check_highlight();
+                }
+                _ => {}
+            },
             WindowEvent::RedrawRequested => {
                 if let Some(rend) = self.renderer.as_mut() {
                     let quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
                         renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
                     }).collect();
 
-                    let banner: Option<&'static str> = match self.status {
-                        chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
-                        chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
-                        chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
-                        chess::GameStatus::Ongoing => None,
+                    let banner: Option<&'static str> = if self.mode == Mode::Local {
+                        match self.status {
+                            chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
+                            chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
+                            chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
+                            chess::GameStatus::Ongoing => None,
+                        }
+                    } else {
+                        None
                     };
 
                     let scene = renderer::Scene {
                         quads: &quads,
-                        board: &self.board,
+                        board: match self.mode {
+                            Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
+                            Mode::Local => &self.board,
+                        },
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
                         banner,
@@ -131,16 +181,61 @@ impl ApplicationHandler for App {
     }
 }
 
+fn pick_game(channels: &std::collections::HashMap<String, lichess::TvGame>) -> Option<String> {
+    for key in ["best", "blitz", "rapid", "bullet", "classical"] {
+        if let Some(g) = channels.get(key) {
+            if let Some(id) = &g.game_id {
+                return Some(id.clone());
+            }
+        }
+    }
+    channels.values().find_map(|g| g.game_id.clone())
+}
+
+fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
+    loop {
+        let game_id = match lichess::fetch_tv_channels() {
+            Ok(channels) => pick_game(&channels),
+            Err(e) => {
+                log::warn!("tv channels fetch failed: {}", e);
+                None
+            }
+        };
+
+        if let Some(game_id) = game_id {
+            match lichess::fetch_game_snapshot(&game_id) {
+                Ok(snap) => {
+                    let moves = snap.moves.unwrap_or_default();
+                    if proxy
+                        .send_event(NetEvent::LiveGame { game_id, moves })
+                        .is_err()
+                    {
+                        return; // window closed
+                    }
+                }
+                Err(e) => log::warn!("snapshot fetch failed: {}", e),
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 fn main() {
     env_logger::init();
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::<NetEvent>::with_user_event().build().unwrap();
+    let proxy = event_loop.create_proxy();
+    std::thread::spawn(move || lichess_worker(proxy));
+
     let mut app = App {
         renderer: None,
         window: None,
         ui: ui::UI::new(),
         board: chess::Board::starting_position(),
+        live_board: None,
         side: chess::Color::White,
         status: chess::GameStatus::Ongoing,
+        mode: Mode::Live,
         cursor_pos: (0.0, 0.0),
     };
     event_loop.run_app(&mut app).unwrap();
