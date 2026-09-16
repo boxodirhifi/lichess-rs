@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "crates/chess",      # Pure chess rules, board state, engine integration
-    "crates/lichess",   # Lichess REST APIs and WebSocket handling
-    "crates/platform",  # Windowing (Wayland/X11), event loop, raw input
-    "crates/renderer",  # wgpu abstraction, shaders, GPU pipelines
-    "crates/ui",        # Our lightweight, immediate-mode or custom retained UI
-    "crates/client"     # The main binary tying the services and state together
+    "crates/chess",
+    "crates/lichess",
+    "crates/platform",
+    "crates/renderer",
+    "crates/ui",
+    "crates/client"
 ]
 resolver = "2"
 
@@ -15,4 +15,11 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
-# We will add our shared dependencies here as we need them (e.g., wgpu, wayland-client, tokio)
+winit = "0.30"
+wgpu = "23"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+raw-window-handle = "0.6"
+glam = "0.29"
+bytemuck = { version = "1.19", features = [ "derive" ] }

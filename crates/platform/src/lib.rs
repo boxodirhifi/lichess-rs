@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use winit::window::{Window, WindowAttributes};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub fn create_window_attrs() -> WindowAttributes {
+    Window::default_attributes()
+        .with_title("Lichess-rs")
+        .with_inner_size(winit::dpi::LogicalSize::new(800, 600))
 }
