@@ -12,3 +12,5 @@ log.workspace = true
 pollster.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
+ab_glyph.workspace = true
+chess = { path = "../chess" }

@@ -10,7 +10,7 @@ struct Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniforms {
-    view_proj: [[f32; 4]; 4],
+    pub view_proj: [[f32; 4]; 4],
 }
 
 pub struct Quad {
@@ -28,6 +28,7 @@ pub struct QuadPipeline {
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_data: Vec<Vertex>,
+    draw_count: u32,
     #[allow(dead_code)]
     max_quads: u32,
 }
@@ -47,29 +48,25 @@ impl QuadPipeline {
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }
-            ],
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
             label: Some("camera_bind_group_layout"),
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
             label: Some("camera_bind_group"),
         });
 
@@ -85,16 +82,14 @@ impl QuadPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                            wgpu::VertexAttribute { offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }
-                        ],
-                    }
-                ],
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                        wgpu::VertexAttribute { offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
+                    ],
+                }],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -111,7 +106,7 @@ impl QuadPipeline {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // UI elements are 2D, so no backface culling
+                cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -123,7 +118,6 @@ impl QuadPipeline {
         });
 
         let max_quads = 4096;
-
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Dynamic Vertex Buffer"),
             size: (max_quads * 4 * std::mem::size_of::<Vertex>() as u32) as u64,
@@ -150,6 +144,7 @@ impl QuadPipeline {
             uniform_buffer,
             bind_group,
             vertex_data: Vec::with_capacity((max_quads * 4) as usize),
+            draw_count: 0,
             max_quads,
         };
         pipeline.resize(queue, width, height);
@@ -162,9 +157,7 @@ impl QuadPipeline {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[camera_uniforms]));
     }
 
-    pub fn draw<'a>(&'a mut self, queue: &wgpu::Queue, render_pass: &mut wgpu::RenderPass<'a>, quads: &[Quad]) {
-        if quads.is_empty() { return; }
-
+    pub fn prepare(&mut self, queue: &wgpu::Queue, quads: &[Quad]) {
         self.vertex_data.clear();
         for q in quads {
             self.vertex_data.push(Vertex { position: [q.x, q.y], color: q.color });
@@ -172,13 +165,20 @@ impl QuadPipeline {
             self.vertex_data.push(Vertex { position: [q.x + q.w, q.y + q.h], color: q.color });
             self.vertex_data.push(Vertex { position: [q.x, q.y + q.h], color: q.color });
         }
+        self.draw_count = quads.len() as u32;
+        if !self.vertex_data.is_empty() {
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_data));
+        }
+    }
 
-        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_data));
-
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        render_pass.draw_indexed(0..(quads.len() as u32 * 6), 0, 0..1);
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.draw_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.render_pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.draw_count * 6, 0, 0..1);
     }
 }

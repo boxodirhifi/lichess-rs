@@ -13,8 +13,7 @@ const SELECTED: [f32; 3] = [106.0 / 255.0, 170.0 / 255.0, 100.0 / 255.0];
 
 pub struct UI {
     pub squares: Vec<Rect>,
-    pub selected: Option<(usize, usize)>, // (row, col)
-    // Cached board geometry for hit-testing
+    pub selected: Option<(usize, usize)>,
     board_px: f32,
     sq_size: f32,
     offset_x: f32,
@@ -53,11 +52,10 @@ impl UI {
                     y: offset_y + r as f32 * sq_size,
                     w: sq_size,
                     h: sq_size,
-                    color: LIGHT, // colors applied below
+                    color: LIGHT,
                 });
             }
         }
-
         self.apply_colors();
     }
 
@@ -70,7 +68,6 @@ impl UI {
         }
     }
 
-    /// Map a physical-pixel position to a board square (row, col), if inside the board.
     pub fn square_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         let bx = x - self.offset_x;
         let by = y - self.offset_y;
@@ -85,13 +82,20 @@ impl UI {
         Some((row, col))
     }
 
-    /// Handle a click. Toggles selection on the clicked square.
     pub fn handle_click(&mut self, x: f32, y: f32) {
         self.selected = match self.square_at(x, y) {
-            Some(sq) if self.selected == Some(sq) => None, // click same square -> deselect
+            Some(sq) if self.selected == Some(sq) => None,
             Some(sq) => Some(sq),
-            None => None, // click off-board -> clear
+            None => None,
         };
         self.apply_colors();
+    }
+
+    pub fn board_offset(&self) -> (f32, f32) {
+        (self.offset_x, self.offset_y)
+    }
+
+    pub fn square_size(&self) -> f32 {
+        self.sq_size
     }
 }
