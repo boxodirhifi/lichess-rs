@@ -72,6 +72,124 @@ impl Board {
         }
     }
 
+    pub fn all_legal_moves(&self, side: Color) -> Vec<Move> {
+        let mut moves = Vec::new();
+        for (sq, piece) in self.iter() {
+            if piece.color == side {
+                moves.extend(self.legal_moves_from(sq));
+            }
+        }
+        moves
+    }
+
+    /// Parse a SAN move (e.g. "Nf3", "O-O", "cxb5", "e8=Q") against the legal
+    /// moves available to `side`. Returns the matching legal move.
+    pub fn move_from_san(&self, san: &str, side: Color) -> Option<Move> {
+        let clean = san.trim().trim_end_matches(|c| "+#!?".contains(c));
+        let legal = self.all_legal_moves(side);
+
+        // Castling
+        if clean == "O-O" || clean == "0-0" {
+            return legal.into_iter().find(|m| self.is_castle(m) && m.to.file() > m.from.file());
+        }
+        if clean == "O-O-O" || clean == "0-0-0" {
+            return legal.into_iter().find(|m| self.is_castle(m) && m.to.file() < m.from.file());
+        }
+
+        // Promotion (e.g. "e8=Q")
+        let (body, promo) = match clean.find('=') {
+            Some(idx) => {
+                let promo_ch = *clean.as_bytes().get(idx + 1)? as char;
+                (&clean[..idx], Some(Self::char_to_kind(promo_ch)?))
+            }
+            None => (clean, None),
+        };
+
+        // Leading piece letter, if present. SAN piece letters are always
+        // UPPERCASE; a lowercase first char is a pawn file (e.g. "b3", "bxc4").
+        let mut body = body;
+        let first = body.chars().next()?;
+        let kind = if matches!(first, 'N' | 'B' | 'R' | 'Q' | 'K') {
+            body = &body[first.len_utf8()..];
+            Self::char_to_kind(first)?
+        } else {
+            PieceKind::Pawn
+        };
+
+        if body.len() < 2 {
+            return None;
+        }
+        let to = Self::parse_square(&body[body.len() - 2..])?;
+        let disambig = &body[..body.len() - 2];
+
+        let mut from_file: Option<u8> = None;
+        let mut from_rank: Option<u8> = None;
+        for ch in disambig.chars() {
+            match ch {
+                'a'..='h' => from_file = Some(ch as u8 - b'a'),
+                '1'..='8' => from_rank = Some(ch as u8 - b'1'),
+                _ => {} // skip 'x' etc.
+            }
+        }
+
+        legal.into_iter().find(|m| {
+            let piece = match self.piece_at(m.from) {
+                Some(p) => p,
+                None => return false,
+            };
+            if piece.kind != kind || m.to != to {
+                return false;
+            }
+            if let Some(f) = from_file {
+                if m.from.file() != f {
+                    return false;
+                }
+            }
+            if let Some(r) = from_rank {
+                if m.from.rank() != r {
+                    return false;
+                }
+            }
+            match (promo, m.promotion) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    /// Apply a whitespace-separated SAN move list, alternating turns.
+    pub fn apply_san_moves(&self, sans: &str, start_side: Color) -> Board {
+        let mut board = self.clone();
+        let mut side = start_side;
+        for san in sans.split_whitespace() {
+            match board.move_from_san(san, side) {
+                Some(mv) => {
+                    board.make_move(mv);
+                    side = side.opposite();
+                }
+                None => break,
+            }
+        }
+        board
+    }
+
+    fn is_castle(&self, m: &Move) -> bool {
+        self.piece_at(m.from).map(|p| p.kind == PieceKind::King).unwrap_or(false)
+            && (m.to.file() as i32 - m.from.file() as i32).abs() == 2
+    }
+
+    fn char_to_kind(ch: char) -> Option<PieceKind> {
+        match ch {
+            'N' | 'n' => Some(PieceKind::Knight),
+            'B' | 'b' => Some(PieceKind::Bishop),
+            'R' | 'r' => Some(PieceKind::Rook),
+            'Q' | 'q' => Some(PieceKind::Queen),
+            'K' | 'k' => Some(PieceKind::King),
+            _ => None,
+        }
+    }
+
     pub fn starting_position() -> Self {
         Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
             .expect("standard starting FEN must parse")
@@ -658,6 +776,54 @@ mod tests {
         let e5 = Square::from_file_rank(4, 4).unwrap();
         let dests: Vec<Square> = board.legal_moves_from(e5).iter().map(|m| m.to).collect();
         assert!(dests.contains(&Square::from_file_rank(3, 5).unwrap())); // d6
+    }
+
+    #[test]
+    fn san_basic_moves() {
+        let board = Board::starting_position();
+        let e4 = board.move_from_san("e4", Color::White).unwrap();
+        assert_eq!(e4.to, Square::from_file_rank(4, 3).unwrap());
+
+        let mut b = board.clone();
+        b.make_move(e4);
+        let c5 = b.move_from_san("c5", Color::Black).unwrap();
+        assert_eq!(c5.to, Square::from_file_rank(2, 4).unwrap());
+        b.make_move(c5);
+        let nf3 = b.move_from_san("Nf3", Color::White).unwrap();
+        assert_eq!(nf3.to, Square::from_file_rank(5, 2).unwrap());
+    }
+
+    #[test]
+    fn san_castling() {
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1").unwrap();
+        let oo = board.move_from_san("O-O", Color::White).unwrap();
+        assert_eq!(oo.to, Square::from_file_rank(6, 0).unwrap()); // g1
+        let ooo = board.move_from_san("O-O-O", Color::White).unwrap();
+        assert_eq!(ooo.to, Square::from_file_rank(2, 0).unwrap()); // c1
+    }
+
+    #[test]
+    fn replay_real_lichess_game() {
+        // A live game pulled from Lichess TV (Sicilian, includes disambiguated
+        // moves like Nbd7/Rac1/Nce2, castling, and the capture cxb5).
+        let sans = "e4 c5 Nf3 e6 d4 cxd4 Nxd4 a6 Bd3 Nf6 O-O Qc7 Qe2 d6 c4 \
+                    Nbd7 Nc3 Ne5 Bg5 Be7 Rac1 h6 Bh4 Nxd3 Qxd3 O-O Kh1 Bd7 \
+                    f4 Rfd8 b3 Be8 Rce1 Rac8 Nce2 b5 cxb5";
+        let mut board = Board::starting_position();
+        let mut side = Color::White;
+        let tokens: Vec<&str> = sans.split_whitespace().collect();
+
+        for (i, san) in tokens.iter().enumerate() {
+            let mv = board.move_from_san(san, side)
+                .unwrap_or_else(|| panic!("failed to parse '{}' at ply {}", san, i));
+            board.make_move(mv);
+            side = side.opposite();
+        }
+
+        // Captures happened, so fewer than 32 pieces remain.
+        assert!(board.iter().count() < 32);
+        // White just played cxb5, so it's black's turn.
+        assert_eq!(side, Color::Black);
     }
 
     #[test]
