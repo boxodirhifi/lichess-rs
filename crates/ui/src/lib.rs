@@ -10,10 +10,12 @@ pub struct Rect {
 const LIGHT: [f32; 3] = [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0];
 const DARK: [f32; 3] = [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0];
 const SELECTED: [f32; 3] = [106.0 / 255.0, 170.0 / 255.0, 100.0 / 255.0];
+const TARGET: [f32; 3] = [0.30, 0.55, 0.85];
 
 pub struct UI {
     pub squares: Vec<Rect>,
-    pub selected: Option<(usize, usize)>,
+    selected: Option<chess::Square>,
+    move_targets: Vec<chess::Square>,
     board_px: f32,
     sq_size: f32,
     offset_x: f32,
@@ -25,6 +27,7 @@ impl UI {
         Self {
             squares: Vec::with_capacity(64),
             selected: None,
+            move_targets: Vec::new(),
             board_px: 0.0,
             sq_size: 0.0,
             offset_x: 0.0,
@@ -34,7 +37,6 @@ impl UI {
 
     pub fn layout(&mut self, screen_w: f32, screen_h: f32) {
         self.squares.clear();
-
         let board_px = screen_w.min(screen_h) * 0.8;
         let sq_size = board_px / 8.0;
         let offset_x = (screen_w - board_px) / 2.0;
@@ -61,14 +63,29 @@ impl UI {
 
     fn apply_colors(&mut self) {
         for (i, rect) in self.squares.iter_mut().enumerate() {
-            let r = i / 8;
-            let c = i % 8;
-            let base = if (r + c) % 2 == 0 { LIGHT } else { DARK };
-            rect.color = if self.selected == Some((r, c)) { SELECTED } else { base };
+            let row = i / 8;
+            let col = i % 8;
+            let base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
+            let sq = Self::square_at_index(i);
+            rect.color = if self.selected == Some(sq) {
+                SELECTED
+            } else if self.move_targets.contains(&sq) {
+                TARGET
+            } else {
+                base
+            };
         }
     }
 
-    pub fn square_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+    /// Screen index -> chess square (row 0 is the top of the screen = rank 8).
+    fn square_at_index(i: usize) -> chess::Square {
+        let row = i / 8;
+        let col = i % 8;
+        chess::Square::from_file_rank(col as u8, (7 - row) as u8).unwrap()
+    }
+
+    /// Map a physical-pixel position to a chess square.
+    pub fn square_at(&self, x: f32, y: f32) -> Option<chess::Square> {
         let bx = x - self.offset_x;
         let by = y - self.offset_y;
         if bx < 0.0 || by < 0.0 || bx >= self.board_px || by >= self.board_px {
@@ -79,16 +96,27 @@ impl UI {
         if col >= 8 || row >= 8 {
             return None;
         }
-        Some((row, col))
+        chess::Square::from_file_rank(col as u8, (7 - row) as u8)
     }
 
-    pub fn handle_click(&mut self, x: f32, y: f32) {
-        self.selected = match self.square_at(x, y) {
-            Some(sq) if self.selected == Some(sq) => None,
-            Some(sq) => Some(sq),
-            None => None,
-        };
+    pub fn select(&mut self, sq: chess::Square, targets: Vec<chess::Square>) {
+        self.selected = Some(sq);
+        self.move_targets = targets;
         self.apply_colors();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+        self.move_targets.clear();
+        self.apply_colors();
+    }
+
+    pub fn selected_square(&self) -> Option<chess::Square> {
+        self.selected
+    }
+
+    pub fn is_move_target(&self, sq: chess::Square) -> bool {
+        self.move_targets.contains(&sq)
     }
 
     pub fn board_offset(&self) -> (f32, f32) {

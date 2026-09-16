@@ -9,7 +9,45 @@ struct App {
     window: Option<Arc<Window>>,
     ui: ui::UI,
     board: chess::Board,
+    side: chess::Color,
     cursor_pos: (f64, f64),
+}
+
+impl App {
+    fn handle_board_click(&mut self, x: f32, y: f32) {
+        let sq = match self.ui.square_at(x, y) {
+            Some(sq) => sq,
+            None => {
+                self.ui.clear_selection();
+                return;
+            }
+        };
+
+        // Clicking a legal destination makes the move.
+        if self.ui.is_move_target(sq) {
+            if let Some(from) = self.ui.selected_square() {
+                if let Some(mv) = self.board.moves_from(from).into_iter().find(|m| m.to == sq) {
+                    self.board.make_move(mv);
+                    self.side = self.side.opposite();
+                }
+            }
+            self.ui.clear_selection();
+            return;
+        }
+
+        // Otherwise select one of our own pieces.
+        if let Some(piece) = self.board.piece_at(sq) {
+            if piece.color == self.side {
+                let mut targets: Vec<chess::Square> =
+                    self.board.moves_from(sq).iter().map(|m| m.to).collect();
+                targets.sort_by_key(|s| s.index());
+                targets.dedup();
+                self.ui.select(sq, targets);
+                return;
+            }
+        }
+        self.ui.clear_selection();
+    }
 }
 
 impl ApplicationHandler for App {
@@ -43,7 +81,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let (x, y) = self.cursor_pos;
-                self.ui.handle_click(x as f32, y as f32);
+                self.handle_board_click(x as f32, y as f32);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(rend) = self.renderer.as_mut() {
@@ -75,6 +113,7 @@ fn main() {
         window: None,
         ui: ui::UI::new(),
         board: chess::Board::starting_position(),
+        side: chess::Color::White,
         cursor_pos: (0.0, 0.0),
     };
     event_loop.run_app(&mut app).unwrap();
