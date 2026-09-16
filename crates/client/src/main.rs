@@ -105,11 +105,20 @@ impl ApplicationHandler for App {
                     let quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
                         renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
                     }).collect();
+
+                    let banner: Option<&'static str> = match self.status {
+                        chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
+                        chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
+                        chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
+                        chess::GameStatus::Ongoing => None,
+                    };
+
                     let scene = renderer::Scene {
                         quads: &quads,
                         board: &self.board,
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
+                        banner,
                     };
                     rend.render(&scene);
                 }

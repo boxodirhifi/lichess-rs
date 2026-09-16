@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use ab_glyph::{Font, FontRef, PxScale};
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use wgpu::util::DeviceExt;
 use crate::quad_pipeline::CameraUniforms;
 
-const ATLAS_SIZE: u32 = 1024;
-const GLYPH_HEIGHT: f32 = 128.0;
+const ATLAS_SIZE: u32 = 2048;
+const RASTER_HEIGHT: f32 = 128.0;
 const PAD: f32 = 2.0;
-const MAX_QUADS: u32 = 512;
+const MAX_QUADS: u32 = 4096;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -20,6 +20,10 @@ struct GlyphInfo {
     uv: [f32; 4],
     width: f32,
     height: f32,
+    offset_x: f32,
+    offset_y: f32,
+    advance: f32,
+    has_bitmap: bool,
 }
 
 pub struct TextPipeline {
@@ -36,13 +40,10 @@ pub struct TextPipeline {
 
 fn load_font_bytes() -> Option<Vec<u8>> {
     let paths = [
-        // Symbola — excellent Unicode coverage incl. chess glyphs (present on Fedora)
         "/usr/share/fonts/gdouros-symbola/Symbola.ttf",
-        // DejaVu variants (other systems)
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        // project-local overrides
         "assets/fonts/Symbola.ttf",
         "assets/fonts/DejaVuSans.ttf",
     ];
@@ -77,58 +78,81 @@ fn piece_colors(color: chess::Color) -> ([f32; 4], [f32; 4]) {
 impl TextPipeline {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, width: f32, height: f32) -> Self {
         let font_bytes = load_font_bytes()
-            .expect("No font with chess glyphs found. Install dejavu-sans-fonts or place DejaVuSans.ttf in assets/fonts/");
+            .expect("No font with chess glyphs found. Install a Unicode font or place one in assets/fonts/");
         let font = FontRef::try_from_slice(&font_bytes).expect("Failed to parse font");
+        let scale = PxScale::from(RASTER_HEIGHT);
+        let scaled = font.as_scaled(scale);
 
-        // ---- Build glyph atlas (filled chess glyphs) ----
-        let chars = ['\u{265A}', '\u{265B}', '\u{265C}', '\u{265D}', '\u{265E}', '\u{265F}'];
+        // ASCII printable range + the filled chess glyphs.
+        let mut chars: Vec<char> = (32u8..=126u8).map(|b| b as char).collect();
+        for ch in ['\u{265A}', '\u{265B}', '\u{265C}', '\u{265D}', '\u{265E}', '\u{265F}'] {
+            chars.push(ch);
+        }
+
         let mut atlas_data = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
         let mut glyphs = HashMap::new();
         let mut pen_x: f32 = PAD;
         let mut pen_y: f32 = PAD;
         let mut row_height: f32 = 0.0;
-        let scale = PxScale::from(GLYPH_HEIGHT);
 
         for ch in chars {
-            let glyph = font.glyph_id(ch).with_scale(scale);
-            let outlined = font.outline_glyph(glyph).expect("glyph outline");
-            let bounds = outlined.px_bounds();
-            let gw = bounds.max.x - bounds.min.x;
-            let gh = bounds.max.y - bounds.min.y;
+            let glyph_id = font.glyph_id(ch);
+            let advance = scaled.h_advance(glyph_id);
+            let glyph = glyph_id.with_scale(scale);
 
-            if pen_x + gw + PAD > ATLAS_SIZE as f32 {
-                pen_x = PAD;
-                pen_y += row_height + PAD;
-                row_height = 0.0;
-            }
-            row_height = row_height.max(gh);
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                let gw = bounds.max.x - bounds.min.x;
+                let gh = bounds.max.y - bounds.min.y;
 
-            outlined.draw(|x, y, c| {
-                let ax = (pen_x + x as f32) as usize;
-                let ay = (pen_y + y as f32) as usize;
-                if ax < ATLAS_SIZE as usize && ay < ATLAS_SIZE as usize {
-                    let idx = ay * ATLAS_SIZE as usize + ax;
-                    let v = (c * 255.0) as u8;
-                    if v > atlas_data[idx] {
-                        atlas_data[idx] = v;
-                    }
+                if pen_x + gw + PAD > ATLAS_SIZE as f32 {
+                    pen_x = PAD;
+                    pen_y += row_height + PAD;
+                    row_height = 0.0;
                 }
-            });
+                row_height = row_height.max(gh);
 
-            glyphs.insert(ch, GlyphInfo {
-                uv: [
-                    pen_x / ATLAS_SIZE as f32,
-                    pen_y / ATLAS_SIZE as f32,
-                    (pen_x + gw) / ATLAS_SIZE as f32,
-                    (pen_y + gh) / ATLAS_SIZE as f32,
-                ],
-                width: gw,
-                height: gh,
-            });
-            pen_x += gw + PAD;
+                outlined.draw(|x, y, c| {
+                    let ax = (pen_x + x as f32) as usize;
+                    let ay = (pen_y + y as f32) as usize;
+                    if ax < ATLAS_SIZE as usize && ay < ATLAS_SIZE as usize {
+                        let idx = ay * ATLAS_SIZE as usize + ax;
+                        let v = (c * 255.0) as u8;
+                        if v > atlas_data[idx] {
+                            atlas_data[idx] = v;
+                        }
+                    }
+                });
+
+                glyphs.insert(ch, GlyphInfo {
+                    uv: [
+                        pen_x / ATLAS_SIZE as f32,
+                        pen_y / ATLAS_SIZE as f32,
+                        (pen_x + gw) / ATLAS_SIZE as f32,
+                        (pen_y + gh) / ATLAS_SIZE as f32,
+                    ],
+                    width: gw,
+                    height: gh,
+                    offset_x: bounds.min.x,
+                    offset_y: bounds.min.y,
+                    advance,
+                    has_bitmap: true,
+                });
+                pen_x += gw + PAD;
+            } else {
+                // No outline (e.g. space): record advance only.
+                glyphs.insert(ch, GlyphInfo {
+                    uv: [0.0; 4],
+                    width: 0.0,
+                    height: 0.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    advance,
+                    has_bitmap: false,
+                });
+            }
         }
 
-        // ---- Upload atlas texture ----
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph_atlas"),
             size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
@@ -161,7 +185,6 @@ impl TextPipeline {
             label: Some("atlas_sampler"),
         });
 
-        // ---- Bind groups ----
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("text camera buffer"),
             size: std::mem::size_of::<CameraUniforms>() as u64,
@@ -217,7 +240,6 @@ impl TextPipeline {
             label: Some("atlas_bg"),
         });
 
-        // ---- Pipeline ----
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("text_shader.wgsl").into()),
@@ -280,7 +302,6 @@ impl TextPipeline {
             cache: None,
         });
 
-        // ---- Dynamic buffers ----
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("text vertex buffer"),
             size: (MAX_QUADS * 4 * std::mem::size_of::<TextVertex>() as u32) as u64,
@@ -320,38 +341,89 @@ impl TextPipeline {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[cam]));
     }
 
-    pub fn prepare(&mut self, queue: &wgpu::Queue, board: &chess::Board, offset_x: f32, offset_y: f32, sq: f32) {
-        self.vertices.clear();
-        if sq <= 0.0 {
-            self.draw_count = 0;
-            return;
-        }
-        for (square, piece) in board.iter() {
-            let file = square.file() as f32;
-            let rank = square.rank() as f32;
-            let cx = offset_x + file * sq + sq * 0.5;
-            let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
-            let ch = piece_char(piece.kind);
-
-            // Copy glyph data out so the immutable borrow of self.glyphs ends
-            // before we mutably borrow self to push vertices.
-            let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));
-            if let Some((uv, gw, gh)) = glyph {
-                let scale = (sq * 0.82) / GLYPH_HEIGHT;
-                let w = gw * scale;
-                let h = gh * scale;
-                let x0 = cx - w * 0.5;
-                let y0 = cy - h * 0.5;
-                let (tint, shadow) = piece_colors(piece.color);
-                let sdx = sq * 0.02;
-                let sdy = sq * 0.03;
-                self.push_quad(x0 + sdx, y0 + sdy, w, h, uv, shadow);
-                self.push_quad(x0, y0, w, h, uv, tint);
+    fn measure_text(&self, text: &str, scale: f32) -> f32 {
+        let mut w = 0.0;
+        for ch in text.chars() {
+            if let Some(g) = self.glyphs.get(&ch) {
+                w += g.advance * scale;
             }
         }
+        w
+    }
+
+    pub fn prepare(
+        &mut self,
+        queue: &wgpu::Queue,
+        board: &chess::Board,
+        offset_x: f32,
+        offset_y: f32,
+        sq: f32,
+        banner: Option<&str>,
+        window_w: f32,
+        window_h: f32,
+    ) {
+        self.vertices.clear();
+
+        // Pieces
+        if sq > 0.0 {
+            for (square, piece) in board.iter() {
+                let file = square.file() as f32;
+                let rank = square.rank() as f32;
+                let cx = offset_x + file * sq + sq * 0.5;
+                let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
+                let ch = piece_char(piece.kind);
+                let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));
+                if let Some((uv, gw, gh)) = glyph {
+                    let scale = (sq * 0.82) / RASTER_HEIGHT;
+                    let w = gw * scale;
+                    let h = gh * scale;
+                    let x0 = cx - w * 0.5;
+                    let y0 = cy - h * 0.5;
+                    let (tint, shadow) = piece_colors(piece.color);
+                    let sdx = sq * 0.02;
+                    let sdy = sq * 0.03;
+                    self.push_quad(x0 + sdx, y0 + sdy, w, h, uv, shadow);
+                    self.push_quad(x0, y0, w, h, uv, tint);
+                }
+            }
+        }
+
+        // Game-over banner (centered, with shadow for readability)
+        if let Some(text) = banner {
+            let size = (sq * 1.1).max(28.0);
+            let scale = size / RASTER_HEIGHT;
+            let total_w = self.measure_text(text, scale);
+            let x = window_w / 2.0 - total_w / 2.0;
+            let baseline = window_h / 2.0 + size * 0.35;
+            let off = size * 0.04;
+            self.push_text(text, x + off, baseline + off, scale, [0.0, 0.0, 0.0, 0.85]);
+            self.push_text(text, x, baseline, scale, [1.0, 1.0, 1.0, 1.0]);
+        }
+
         self.draw_count = (self.vertices.len() / 4) as u32;
         if !self.vertices.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+        }
+    }
+
+    fn push_text(&mut self, text: &str, x: f32, baseline_y: f32, scale: f32, color: [f32; 4]) {
+        let mut pen_x = x;
+        for ch in text.chars() {
+            // Copy the glyph data out so the immutable borrow of self.glyphs
+            // ends before we mutably borrow self to push vertices.
+            let glyph = self.glyphs.get(&ch).map(|g| {
+                (g.uv, g.width, g.height, g.offset_x, g.offset_y, g.advance, g.has_bitmap)
+            });
+            if let Some((uv, gw, gh, ox, oy, advance, has_bitmap)) = glyph {
+                if has_bitmap {
+                    let gx = pen_x + ox * scale;
+                    let gy = baseline_y + oy * scale;
+                    let w = gw * scale;
+                    let h = gh * scale;
+                    self.push_quad(gx, gy, w, h, uv, color);
+                }
+                pen_x += advance * scale;
+            }
         }
     }
 

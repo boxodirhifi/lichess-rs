@@ -14,6 +14,7 @@ pub struct Scene<'a> {
     pub board: &'a Board,
     pub board_offset: (f32, f32),
     pub square_size: f32,
+    pub banner: Option<&'a str>,
 }
 
 pub struct Renderer {
@@ -105,9 +106,17 @@ impl Renderer {
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Upload geometry OUTSIDE the render pass
         self.quad_pipeline.prepare(&self.queue, scene.quads);
-        self.text_pipeline.prepare(&self.queue, scene.board, scene.board_offset.0, scene.board_offset.1, scene.square_size);
+        self.text_pipeline.prepare(
+            &self.queue,
+            scene.board,
+            scene.board_offset.0,
+            scene.board_offset.1,
+            scene.square_size,
+            scene.banner,
+            self.config.width as f32,
+            self.config.height as f32,
+        );
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
