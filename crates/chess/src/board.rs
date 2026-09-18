@@ -694,6 +694,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_lichess_fen() {
+        let fen = "2r3k1/2N1n1bp/5p2/p3p2p/2R3P1/2P2P2/P4B2/6K1 b - - 2 39";
+        let board = Board::from_fen(fen).expect("parse lichess fen");
+        assert_eq!(board.iter().count(), 12);
+    }
+
+    #[test]
     fn blocked_bishop_has_no_moves() {
         let board = Board::starting_position();
         let c1 = Square::from_file_rank(2, 0).unwrap();

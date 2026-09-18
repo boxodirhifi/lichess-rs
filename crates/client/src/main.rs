@@ -1,13 +1,14 @@
 use winit::application::ApplicationHandler;
-use winit::window::{Window, WindowId};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::window::{Window, WindowId};
 use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    LiveGame { game_id: String, moves: String },
+    FeaturedGame { game_id: String, fen: String },
+    FenUpdate { fen: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +41,7 @@ impl App {
 
     fn handle_board_click(&mut self, x: f32, y: f32) {
         if self.mode == Mode::Live {
-            return; // spectating only
+            return;
         }
         if self.status != chess::GameStatus::Ongoing {
             return;
@@ -96,10 +97,15 @@ impl ApplicationHandler<NetEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
         match event {
-            NetEvent::LiveGame { game_id: _, moves } => {
-                let board = chess::Board::starting_position()
-                    .apply_san_moves(&moves, chess::Color::White);
-                self.live_board = Some(board);
+            NetEvent::FeaturedGame { game_id: _, fen } => {
+                if let Some(board) = chess::Board::from_fen(&fen) {
+                    self.live_board = Some(board);
+                }
+            }
+            NetEvent::FenUpdate { fen } => {
+                if let Some(board) = chess::Board::from_fen(&fen) {
+                    self.live_board = Some(board);
+                }
             }
         }
     }
@@ -181,43 +187,27 @@ impl ApplicationHandler<NetEvent> for App {
     }
 }
 
-fn pick_game(channels: &std::collections::HashMap<String, lichess::TvGame>) -> Option<String> {
-    for key in ["best", "blitz", "rapid", "bullet", "classical"] {
-        if let Some(g) = channels.get(key) {
-            if let Some(id) = &g.game_id {
-                return Some(id.clone());
-            }
-        }
-    }
-    channels.values().find_map(|g| g.game_id.clone())
-}
-
 fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
     loop {
-        let game_id = match lichess::fetch_tv_channels() {
-            Ok(channels) => pick_game(&channels),
-            Err(e) => {
-                log::warn!("tv channels fetch failed: {}", e);
-                None
-            }
-        };
-
-        if let Some(game_id) = game_id {
-            match lichess::fetch_game_snapshot(&game_id) {
-                Ok(snap) => {
-                    let moves = snap.moves.unwrap_or_default();
-                    if proxy
-                        .send_event(NetEvent::LiveGame { game_id, moves })
-                        .is_err()
-                    {
-                        return; // window closed
-                    }
+        log::info!("Connecting to Lichess TV stream...");
+        let result = lichess::stream_tv_feed(|event| {
+            match event {
+                lichess::TvStreamEvent::Featured(data) => {
+                    let _ = proxy.send_event(NetEvent::FeaturedGame {
+                        game_id: data.id,
+                        fen: data.fen,
+                    });
                 }
-                Err(e) => log::warn!("snapshot fetch failed: {}", e),
+                lichess::TvStreamEvent::Fen(data) => {
+                    let _ = proxy.send_event(NetEvent::FenUpdate { fen: data.fen });
+                }
             }
-        }
+        });
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        if let Err(e) = result {
+            log::warn!("Stream ended: {}, reconnecting in 1s", e);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 }
 

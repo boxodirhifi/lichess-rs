@@ -1,5 +1,6 @@
 use crate::types::{GameSnapshot, TvGame};
 use std::collections::HashMap;
+use crate::types::TvStreamEvent;
 
 const BASE: &str = "https://lichess.org";
 
@@ -109,4 +110,27 @@ mod tests {
             "expected a lastFen or a non-empty moves list"
         );
     }
+}
+
+use std::io::{BufRead, BufReader};
+
+/// Open a long-lived NDJSON stream to the Lichess TV feed.
+/// Calls `callback` for each event. Returns `Err` when the stream ends.
+pub fn stream_tv_feed(mut callback: impl FnMut(TvStreamEvent)) -> Result<(), Error> {
+    let resp = ureq::get(&format!("{}/api/tv/feed", BASE))
+        .set("Accept", "application/x-ndjson")
+        .call()?;
+
+    let reader = BufReader::new(resp.into_reader());
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TvStreamEvent>(&line) {
+            Ok(event) => callback(event),
+            Err(e) => log::warn!("Failed to parse stream event: {}", e),
+        }
+    }
+    Ok(())
 }

@@ -40,3 +40,44 @@ pub struct GameSnapshot {
     pub moves: Option<String>,
     pub players: Option<Players>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamPlayer {
+    pub color: String,
+    pub user: StreamUser,
+    pub rating: u32,
+    pub seconds: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamUser {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeaturedData {
+    pub id: String,
+    pub orientation: String,
+    pub players: Vec<StreamPlayer>,
+    pub fen: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FenData {
+    pub fen: String,
+    pub lm: String,
+    pub wc: u32,
+    pub bc: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "t", content = "d")]
+pub enum TvStreamEvent {
+    #[serde(rename = "featured")]
+    Featured(FeaturedData),
+    #[serde(rename = "fen")]
+    Fen(FenData),
+}
