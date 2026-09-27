@@ -4,11 +4,24 @@ use winit::window::{Window, WindowId};
 use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    FeaturedGame { game_id: String, fen: String },
-    FenUpdate { fen: String },
+    FeaturedGame {
+        fen: String,
+        white_name: String,
+        white_rating: u32,
+        black_name: String,
+        black_rating: u32,
+        white_secs: u32,
+        black_secs: u32,
+    },
+    FenUpdate {
+        fen: String,
+        white_secs: u32,
+        black_secs: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,16 +30,40 @@ enum Mode {
     Live,
 }
 
+struct LiveGameInfo {
+    white_name: String,
+    black_name: String,
+    white_rating: u32,
+    black_rating: u32,
+    white_clock: f64,
+    black_clock: f64,
+    side_to_move: chess::Color,
+    last_update: Instant,
+}
+
 struct App {
     renderer: Option<renderer::Renderer>,
     window: Option<Arc<Window>>,
     ui: ui::UI,
     board: chess::Board,
     live_board: Option<chess::Board>,
+    live_info: Option<LiveGameInfo>,
     side: chess::Color,
     status: chess::GameStatus,
     mode: Mode,
     cursor_pos: (f64, f64),
+}
+
+fn side_from_fen(fen: &str) -> chess::Color {
+    match fen.split_whitespace().nth(1) {
+        Some("b") => chess::Color::Black,
+        _ => chess::Color::White,
+    }
+}
+
+fn format_clock(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 impl App {
@@ -39,6 +76,65 @@ impl App {
         self.ui.set_checked_king(checked);
     }
 
+    fn build_texts(&self) -> Vec<renderer::TextElement> {
+        let mut texts = Vec::new();
+        if self.mode != Mode::Live {
+            return texts;
+        }
+        let info = match &self.live_info {
+            Some(i) => i,
+            None => return texts,
+        };
+
+        let sq = self.ui.square_size();
+        let board_px = sq * 8.0;
+        let (ox, oy) = self.ui.board_offset();
+        let left = ox;
+        let right = ox + board_px;
+        let font_size = (sq * 0.35).max(14.0);
+        let white = [1.0, 1.0, 1.0, 1.0];
+
+        let elapsed = info.last_update.elapsed().as_secs_f64();
+        let white_clock = if info.side_to_move == chess::Color::White {
+            (info.white_clock - elapsed).max(0.0)
+        } else {
+            info.white_clock
+        };
+        let black_clock = if info.side_to_move == chess::Color::Black {
+            (info.black_clock - elapsed).max(0.0)
+        } else {
+            info.black_clock
+        };
+
+        // Black bar (above the board)
+        let top_y = oy - font_size * 0.4;
+        texts.push(renderer::TextElement {
+            text: format!("{} ({})", info.black_name, info.black_rating),
+            x: left, y: top_y, size: font_size, color: white,
+            align: renderer::TextAlign::Left,
+        });
+        texts.push(renderer::TextElement {
+            text: format_clock(black_clock),
+            x: right, y: top_y, size: font_size, color: white,
+            align: renderer::TextAlign::Right,
+        });
+
+        // White bar (below the board)
+        let bottom_y = oy + board_px + font_size * 1.1;
+        texts.push(renderer::TextElement {
+            text: format!("{} ({})", info.white_name, info.white_rating),
+            x: left, y: bottom_y, size: font_size, color: white,
+            align: renderer::TextAlign::Left,
+        });
+        texts.push(renderer::TextElement {
+            text: format_clock(white_clock),
+            x: right, y: bottom_y, size: font_size, color: white,
+            align: renderer::TextAlign::Right,
+        });
+
+        texts
+    }
+
     fn handle_board_click(&mut self, x: f32, y: f32) {
         if self.mode == Mode::Live {
             return;
@@ -46,7 +142,6 @@ impl App {
         if self.status != chess::GameStatus::Ongoing {
             return;
         }
-
         let sq = match self.ui.square_at(x, y) {
             Some(sq) => sq,
             None => {
@@ -54,7 +149,6 @@ impl App {
                 return;
             }
         };
-
         if self.ui.is_move_target(sq) {
             if let Some(from) = self.ui.selected_square() {
                 if let Some(mv) = self.board.legal_moves_from(from).into_iter().find(|m| m.to == sq) {
@@ -67,7 +161,6 @@ impl App {
             self.ui.clear_selection();
             return;
         }
-
         if let Some(piece) = self.board.piece_at(sq) {
             if piece.color == self.side {
                 let mut targets: Vec<chess::Square> =
@@ -97,14 +190,30 @@ impl ApplicationHandler<NetEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
         match event {
-            NetEvent::FeaturedGame { game_id: _, fen } => {
+            NetEvent::FeaturedGame { fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs } => {
                 if let Some(board) = chess::Board::from_fen(&fen) {
                     self.live_board = Some(board);
                 }
+                self.live_info = Some(LiveGameInfo {
+                    white_name,
+                    black_name,
+                    white_rating,
+                    black_rating,
+                    white_clock: white_secs as f64,
+                    black_clock: black_secs as f64,
+                    side_to_move: side_from_fen(&fen),
+                    last_update: Instant::now(),
+                });
             }
-            NetEvent::FenUpdate { fen } => {
+            NetEvent::FenUpdate { fen, white_secs, black_secs } => {
                 if let Some(board) = chess::Board::from_fen(&fen) {
                     self.live_board = Some(board);
+                }
+                if let Some(info) = &mut self.live_info {
+                    info.white_clock = white_secs as f64;
+                    info.black_clock = black_secs as f64;
+                    info.side_to_move = side_from_fen(&fen);
+                    info.last_update = Instant::now();
                 }
             }
         }
@@ -150,22 +259,22 @@ impl ApplicationHandler<NetEvent> for App {
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
+                let texts = self.build_texts();
+                let quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
+                    renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
+                }).collect();
+                let banner: Option<&'static str> = if self.mode == Mode::Local {
+                    match self.status {
+                        chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
+                        chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
+                        chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
+                        chess::GameStatus::Ongoing => None,
+                    }
+                } else {
+                    None
+                };
+
                 if let Some(rend) = self.renderer.as_mut() {
-                    let quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
-                        renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
-                    }).collect();
-
-                    let banner: Option<&'static str> = if self.mode == Mode::Local {
-                        match self.status {
-                            chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
-                            chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
-                            chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
-                            chess::GameStatus::Ongoing => None,
-                        }
-                    } else {
-                        None
-                    };
-
                     let scene = renderer::Scene {
                         quads: &quads,
                         board: match self.mode {
@@ -175,6 +284,7 @@ impl ApplicationHandler<NetEvent> for App {
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
                         banner,
+                        texts: &texts,
                     };
                     rend.render(&scene);
                 }
@@ -193,13 +303,34 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
         let result = lichess::stream_tv_feed(|event| {
             match event {
                 lichess::TvStreamEvent::Featured(data) => {
+                    let mut white_name = String::new();
+                    let mut black_name = String::new();
+                    let (mut white_rating, mut black_rating) = (0, 0);
+                    let (mut white_secs, mut black_secs) = (0, 0);
+                    for p in &data.players {
+                        if p.color == "white" {
+                            white_name = p.user.name.clone();
+                            white_rating = p.rating;
+                            white_secs = p.seconds;
+                        } else {
+                            black_name = p.user.name.clone();
+                            black_rating = p.rating;
+                            black_secs = p.seconds;
+                        }
+                    }
                     let _ = proxy.send_event(NetEvent::FeaturedGame {
-                        game_id: data.id,
                         fen: data.fen,
+                        white_name, white_rating,
+                        black_name, black_rating,
+                        white_secs, black_secs,
                     });
                 }
                 lichess::TvStreamEvent::Fen(data) => {
-                    let _ = proxy.send_event(NetEvent::FenUpdate { fen: data.fen });
+                    let _ = proxy.send_event(NetEvent::FenUpdate {
+                        fen: data.fen,
+                        white_secs: data.wc,
+                        black_secs: data.bc,
+                    });
                 }
             }
         });
@@ -223,6 +354,7 @@ fn main() {
         ui: ui::UI::new(),
         board: chess::Board::starting_position(),
         live_board: None,
+        live_info: None,
         side: chess::Color::White,
         status: chess::GameStatus::Ongoing,
         mode: Mode::Live,

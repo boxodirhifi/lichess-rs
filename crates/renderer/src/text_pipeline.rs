@@ -16,6 +16,23 @@ struct TextVertex {
     color: [f32; 4],
 }
 
+#[derive(Debug, Clone)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextElement {
+    pub text: String,
+    pub x: f32,
+    pub y: f32, // baseline
+    pub size: f32,
+    pub color: [f32; 4],
+    pub align: TextAlign,
+}
+
 struct GlyphInfo {
     uv: [f32; 4],
     width: f32,
@@ -358,9 +375,7 @@ impl TextPipeline {
         offset_x: f32,
         offset_y: f32,
         sq: f32,
-        banner: Option<&str>,
-        window_w: f32,
-        window_h: f32,
+        texts: &[TextElement],
     ) {
         self.vertices.clear();
 
@@ -388,16 +403,18 @@ impl TextPipeline {
             }
         }
 
-        // Game-over banner (centered, with shadow for readability)
-        if let Some(text) = banner {
-            let size = (sq * 1.1).max(28.0);
-            let scale = size / RASTER_HEIGHT;
-            let total_w = self.measure_text(text, scale);
-            let x = window_w / 2.0 - total_w / 2.0;
-            let baseline = window_h / 2.0 + size * 0.35;
-            let off = size * 0.04;
-            self.push_text(text, x + off, baseline + off, scale, [0.0, 0.0, 0.0, 0.85]);
-            self.push_text(text, x, baseline, scale, [1.0, 1.0, 1.0, 1.0]);
+        // Texts
+        for t in texts {
+            let scale = t.size / RASTER_HEIGHT;
+            let total_w = self.measure_text(&t.text, scale);
+            let x = match t.align {
+                TextAlign::Left => t.x,
+                TextAlign::Center => t.x - total_w / 2.0,
+                TextAlign::Right => t.x - total_w,
+            };
+            let off = t.size * 0.04;
+            self.push_text(&t.text, x + off, t.y + off, scale, [0.0, 0.0, 0.0, 0.85]);
+            self.push_text(&t.text, x, t.y, scale, t.color);
         }
 
         self.draw_count = (self.vertices.len() / 4) as u32;

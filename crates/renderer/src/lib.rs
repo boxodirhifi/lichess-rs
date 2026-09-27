@@ -6,6 +6,7 @@ use chess::Board;
 mod quad_pipeline;
 mod text_pipeline;
 pub use quad_pipeline::Quad;
+pub use text_pipeline::{TextAlign, TextElement};
 use quad_pipeline::QuadPipeline;
 use text_pipeline::TextPipeline;
 
@@ -15,6 +16,7 @@ pub struct Scene<'a> {
     pub board_offset: (f32, f32),
     pub square_size: f32,
     pub banner: Option<&'a str>,
+    pub texts: &'a [TextElement],
 }
 
 pub struct Renderer {
@@ -106,6 +108,20 @@ impl Renderer {
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Convert the banner (if any) into a centered TextElement using window size.
+        let mut all_texts: Vec<TextElement> = scene.texts.to_vec();
+        if let Some(banner) = scene.banner {
+            let size = (scene.square_size * 1.1).max(28.0);
+            all_texts.push(TextElement {
+                text: banner.to_string(),
+                x: self.config.width as f32 / 2.0,
+                y: self.config.height as f32 / 2.0 + size * 0.35,
+                size,
+                color: [1.0, 1.0, 1.0, 1.0],
+                align: TextAlign::Center,
+            });
+        }
+
         self.quad_pipeline.prepare(&self.queue, scene.quads);
         self.text_pipeline.prepare(
             &self.queue,
@@ -113,9 +129,7 @@ impl Renderer {
             scene.board_offset.0,
             scene.board_offset.1,
             scene.square_size,
-            scene.banner,
-            self.config.width as f32,
-            self.config.height as f32,
+            &all_texts,
         );
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
