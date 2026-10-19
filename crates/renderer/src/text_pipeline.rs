@@ -375,6 +375,7 @@ impl TextPipeline {
         offset_x: f32,
         offset_y: f32,
         sq: f32,
+        pieces: &[crate::PieceElement],
         texts: &[TextElement],
     ) {
         self.vertices.clear();
@@ -386,21 +387,13 @@ impl TextPipeline {
                 let rank = square.rank() as f32;
                 let cx = offset_x + file * sq + sq * 0.5;
                 let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
-                let ch = piece_char(piece.kind);
-                let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));
-                if let Some((uv, gw, gh)) = glyph {
-                    let scale = (sq * 0.82) / RASTER_HEIGHT;
-                    let w = gw * scale;
-                    let h = gh * scale;
-                    let x0 = cx - w * 0.5;
-                    let y0 = cy - h * 0.5;
-                    let (tint, shadow) = piece_colors(piece.color);
-                    let sdx = sq * 0.02;
-                    let sdy = sq * 0.03;
-                    self.push_quad(x0 + sdx, y0 + sdy, w, h, uv, shadow);
-                    self.push_quad(x0, y0, w, h, uv, tint);
-                }
+                self.push_piece(piece.kind, piece.color, cx, cy, sq);
             }
+        }
+
+        // Extra pieces (promotion menu, captured material, ...)
+        for p in pieces {
+            self.push_piece(p.kind, p.color, p.x, p.y, p.size);
         }
 
         // Texts
@@ -421,6 +414,26 @@ impl TextPipeline {
         if !self.vertices.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
         }
+    }
+
+    fn push_piece(&mut self, kind: chess::PieceKind, color: chess::Color, cx: f32, cy: f32, size: f32) {
+        let ch = piece_char(kind);
+        // Copy the glyph data out so the immutable borrow of self.glyphs
+        // ends before we mutably borrow self to push vertices.
+        let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));
+        let Some((uv, gw, gh)) = glyph else {
+            return;
+        };
+        let scale = (size * 0.82) / RASTER_HEIGHT;
+        let w = gw * scale;
+        let h = gh * scale;
+        let x0 = cx - w * 0.5;
+        let y0 = cy - h * 0.5;
+        let (tint, shadow) = piece_colors(color);
+        let sdx = size * 0.02;
+        let sdy = size * 0.03;
+        self.push_quad(x0 + sdx, y0 + sdy, w, h, uv, shadow);
+        self.push_quad(x0, y0, w, h, uv, tint);
     }
 
     fn push_text(&mut self, text: &str, x: f32, baseline_y: f32, scale: f32, color: [f32; 4]) {

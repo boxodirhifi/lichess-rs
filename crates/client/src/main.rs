@@ -135,11 +135,41 @@ impl App {
         texts
     }
 
+    /// Play a completed promotion and return to normal play.
+    fn finish_promotion(&mut self, kind: chess::PieceKind) {
+        let Some((from, to, _)) = self.ui.close_promotion() else {
+            return;
+        };
+        if let Some(mv) = self
+            .board
+            .legal_moves_from(from)
+            .into_iter()
+            .find(|m| m.to == to && m.promotion == Some(kind))
+        {
+            self.board.make_move(mv);
+            self.side = self.side.opposite();
+            self.status = self.board.status(self.side);
+            self.refresh_check_highlight();
+        }
+        self.ui.clear_selection();
+    }
+
     fn handle_board_click(&mut self, x: f32, y: f32) {
         if self.mode == Mode::Live {
             return;
         }
         if self.status != chess::GameStatus::Ongoing {
+            return;
+        }
+        // A click while the promotion menu is open either picks a piece or
+        // dismisses the menu and keeps the pawn selected.
+        if self.ui.promotion_open() {
+            match self.ui.promotion_at(x, y) {
+                Some(kind) => self.finish_promotion(kind),
+                None => {
+                    self.ui.close_promotion();
+                }
+            }
             return;
         }
         let sq = match self.ui.square_at(x, y) {
@@ -151,7 +181,19 @@ impl App {
         };
         if self.ui.is_move_target(sq) {
             if let Some(from) = self.ui.selected_square() {
-                if let Some(mv) = self.board.legal_moves_from(from).into_iter().find(|m| m.to == sq) {
+                let candidates: Vec<chess::Move> = self
+                    .board
+                    .legal_moves_from(from)
+                    .into_iter()
+                    .filter(|m| m.to == sq)
+                    .collect();
+                let promotion = candidates.iter().any(|m| m.promotion.is_some());
+                if promotion {
+                    // Let the player pick the piece before playing the move.
+                    self.ui.open_promotion(from, sq, self.side);
+                    return;
+                }
+                if let Some(&mv) = candidates.first() {
                     self.board.make_move(mv);
                     self.side = self.side.opposite();
                     self.status = self.board.status(self.side);
@@ -250,18 +292,37 @@ impl ApplicationHandler<NetEvent> for App {
                 KeyCode::KeyL => {
                     self.mode = Mode::Live;
                     self.ui.clear_selection();
+                    self.ui.clear_promotion();
                     self.ui.set_checked_king(None);
                 }
                 KeyCode::KeyP => {
                     self.mode = Mode::Local;
                     self.refresh_check_highlight();
                 }
+                KeyCode::Escape => {
+                    // Dismiss the promotion menu, leaving the pawn selected.
+                    self.ui.close_promotion();
+                }
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
                 let texts = self.build_texts();
-                let quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
+                let cursor = Some((self.cursor_pos.0 as f32, self.cursor_pos.1 as f32));
+                let mut quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
                     renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
+                }).collect();
+                // Promotion menu on top of the board squares.
+                for r in self.ui.promotion_quads(cursor) {
+                    quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
+                }
+                let pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
+                    renderer::PieceElement {
+                        kind: c.kind,
+                        color: c.color,
+                        x: c.rect.x + c.rect.w * 0.5,
+                        y: c.rect.y + c.rect.h * 0.5,
+                        size: c.rect.h,
+                    }
                 }).collect();
                 let banner: Option<&'static str> = if self.mode == Mode::Local {
                     match self.status {
@@ -285,6 +346,7 @@ impl ApplicationHandler<NetEvent> for App {
                         square_size: self.ui.square_size(),
                         banner,
                         texts: &texts,
+                        pieces: &pieces,
                     };
                     rend.render(&scene);
                 }
@@ -361,4 +423,194 @@ fn main() {
         cursor_pos: (0.0, 0.0),
     };
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A board with a white pawn on the 7th rank, ready to promote.
+    fn app_with_promoting_pawn() -> App {
+        let mut app = App {
+            renderer: None,
+            window: None,
+            ui: ui::UI::new(),
+            board: chess::Board::from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1").unwrap(),
+            live_board: None,
+            live_info: None,
+            side: chess::Color::White,
+            status: chess::GameStatus::Ongoing,
+            mode: Mode::Local,
+            cursor_pos: (0.0, 0.0),
+        };
+        // 800x600: the board is 480px, offset (160, 60), squares 60px.
+        app.ui.layout(800.0, 600.0);
+        app
+    }
+
+    /// Center of a square in window coordinates.
+    fn square_center(app: &App, sq: chess::Square) -> (f32, f32) {
+        let (ox, oy) = app.ui.board_offset();
+        let s = app.ui.square_size();
+        (
+            ox + (sq.file() as f32 + 0.5) * s,
+            oy + (7.0 - sq.rank() as f32 + 0.5) * s,
+        )
+    }
+
+    /// Center of a promotion menu cell.
+    fn choice_center(app: &App, kind: chess::PieceKind) -> (f32, f32) {
+        let cell = app
+            .ui
+            .promotion_choices()
+            .iter()
+            .find(|c| c.kind == kind)
+            .expect("promotion choice missing");
+        (
+            cell.rect.x + cell.rect.w * 0.5,
+            cell.rect.y + cell.rect.h * 0.5,
+        )
+    }
+
+    #[test]
+    fn promoting_opens_the_menu_instead_of_moving() {
+        let mut app = app_with_promoting_pawn();
+        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
+        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+
+        let (x, y) = square_center(&app, e7);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.selected_square(), Some(e7));
+
+        let (x, y) = square_center(&app, e8);
+        app.handle_board_click(x, y);
+
+        assert!(app.ui.promotion_open(), "menu should be open after the click");
+        assert_eq!(app.ui.promotion_from(), Some(e7));
+        // The pawn has not moved yet.
+        assert!(matches!(
+            app.board.piece_at(e7).map(|p| p.kind),
+            Some(chess::PieceKind::Pawn)
+        ));
+        assert!(app.board.piece_at(e8).is_none());
+        // The game is still White's move.
+        assert_eq!(app.side, chess::Color::White);
+    }
+
+    #[test]
+    fn picking_a_choice_plays_that_piece() {
+        let mut app = app_with_promoting_pawn();
+        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
+        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+
+        let (x, y) = square_center(&app, e7);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, e8);
+        app.handle_board_click(x, y);
+        assert!(app.ui.promotion_open());
+
+        let (x, y) = choice_center(&app, chess::PieceKind::Knight);
+        app.handle_board_click(x, y);
+
+        assert!(!app.ui.promotion_open(), "menu should close after picking");
+        assert!(app.board.piece_at(e7).is_none());
+        assert_eq!(
+            app.board.piece_at(e8).map(|p| (p.kind, p.color)),
+            Some((chess::PieceKind::Knight, chess::Color::White))
+        );
+        assert_eq!(app.side, chess::Color::Black);
+    }
+
+    #[test]
+    fn every_choice_produces_its_piece() {
+        for kind in [
+            chess::PieceKind::Queen,
+            chess::PieceKind::Rook,
+            chess::PieceKind::Bishop,
+            chess::PieceKind::Knight,
+        ] {
+            let mut app = app_with_promoting_pawn();
+            let e7 = chess::Square::from_file_rank(4, 6).unwrap();
+            let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+
+            let (x, y) = square_center(&app, e7);
+            app.handle_board_click(x, y);
+            let (x, y) = square_center(&app, e8);
+            app.handle_board_click(x, y);
+
+            let (x, y) = choice_center(&app, kind);
+            app.handle_board_click(x, y);
+
+            assert_eq!(
+                app.board.piece_at(e8).map(|p| p.kind),
+                Some(kind),
+                "wrong piece for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_away_from_the_menu_dismisses_it() {
+        let mut app = app_with_promoting_pawn();
+        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
+        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+
+        let (x, y) = square_center(&app, e7);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, e8);
+        app.handle_board_click(x, y);
+        assert!(app.ui.promotion_open());
+
+        // A click on the far corner of the window is not a choice.
+        app.handle_board_click(2.0, 2.0);
+
+        assert!(!app.ui.promotion_open());
+        // The pawn is still on the 7th rank and still selected, so the player
+        // can pick another piece without re-selecting.
+        assert!(matches!(
+            app.board.piece_at(e7).map(|p| p.kind),
+            Some(chess::PieceKind::Pawn)
+        ));
+        assert_eq!(app.ui.selected_square(), Some(e7));
+    }
+
+    #[test]
+    fn closing_the_menu_keeps_the_pawn_selected() {
+        let mut app = app_with_promoting_pawn();
+        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
+        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+
+        let (x, y) = square_center(&app, e7);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, e8);
+        app.handle_board_click(x, y);
+        assert!(app.ui.promotion_open());
+
+        // What Escape runs; the pawn stays put and selected.
+        app.ui.close_promotion();
+        assert!(!app.ui.promotion_open());
+        assert!(matches!(
+            app.board.piece_at(e7).map(|p| p.kind),
+            Some(chess::PieceKind::Pawn)
+        ));
+        assert_eq!(app.ui.selected_square(), Some(e7));
+    }
+
+    #[test]
+    fn ordinary_still_moves_immediately() {
+        let mut app = app_with_promoting_pawn();
+        let d2 = chess::Square::from_file_rank(3, 1).unwrap();
+        let d4 = chess::Square::from_file_rank(3, 3).unwrap();
+
+        // A pawn on d2 is not promoting, so a two-square push just happens.
+        app.board.set_piece(d2, Some(chess::Piece::new(chess::PieceKind::Pawn, chess::Color::White)));
+        let (x, y) = square_center(&app, d2);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, d4);
+        app.handle_board_click(x, y);
+
+        assert!(!app.ui.promotion_open());
+        assert!(app.board.piece_at(d4).is_some());
+        assert_eq!(app.side, chess::Color::Black);
+    }
 }

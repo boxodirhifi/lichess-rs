@@ -10,6 +10,19 @@ pub use text_pipeline::{TextAlign, TextElement};
 use quad_pipeline::QuadPipeline;
 use text_pipeline::TextPipeline;
 
+/// A single piece drawn at an arbitrary screen position, using the same glyph
+/// and shadow treatment as the pieces on the board.
+#[derive(Debug, Clone, Copy)]
+pub struct PieceElement {
+    pub kind: chess::PieceKind,
+    pub color: chess::Color,
+    /// Center of the piece, in screen pixels.
+    pub x: f32,
+    pub y: f32,
+    /// Nominal size in pixels; the glyph is scaled to ~0.82 of this, like a square.
+    pub size: f32,
+}
+
 pub struct Scene<'a> {
     pub quads: &'a [Quad],
     pub board: &'a Board,
@@ -17,6 +30,8 @@ pub struct Scene<'a> {
     pub square_size: f32,
     pub banner: Option<&'a str>,
     pub texts: &'a [TextElement],
+    /// Extra pieces to draw (e.g. a promotion menu); drawn after the board pieces.
+    pub pieces: &'a [PieceElement],
 }
 
 pub struct Renderer {
@@ -129,6 +144,7 @@ impl Renderer {
             scene.board_offset.0,
             scene.board_offset.1,
             scene.square_size,
+            scene.pieces,
             &all_texts,
         );
 
