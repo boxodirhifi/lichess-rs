@@ -39,6 +39,7 @@ struct LiveGameInfo {
     black_clock: f64,
     side_to_move: chess::Color,
     last_update: Instant,
+    game_over: bool,
 }
 
 struct App {
@@ -94,7 +95,12 @@ impl App {
         let font_size = (sq * 0.35).max(14.0);
         let white = [1.0, 1.0, 1.0, 1.0];
 
-        let elapsed = info.last_update.elapsed().as_secs_f64();
+        // Freeze the clocks once the game is over so they don't drain forever.
+        let elapsed = if info.game_over {
+            0.0
+        } else {
+            info.last_update.elapsed().as_secs_f64()
+        };
         let white_clock = if info.side_to_move == chess::Color::White {
             (info.white_clock - elapsed).max(0.0)
         } else {
@@ -228,6 +234,11 @@ impl ApplicationHandler<NetEvent> for App {
         let rend = pollster::block_on(renderer::Renderer::new(window.clone()));
         self.window = Some(window);
         self.renderer = Some(rend);
+
+        // Request the very first frame
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
@@ -245,23 +256,36 @@ impl ApplicationHandler<NetEvent> for App {
                     black_clock: black_secs as f64,
                     side_to_move: side_from_fen(&fen),
                     last_update: Instant::now(),
+                    game_over: false,
                 });
             }
             NetEvent::FenUpdate { fen, white_secs, black_secs } => {
                 if let Some(board) = chess::Board::from_fen(&fen) {
+                    let side = side_from_fen(&fen);
+                    let terminal = !matches!(board.status(side), chess::GameStatus::Ongoing);
                     self.live_board = Some(board);
-                }
-                if let Some(info) = &mut self.live_info {
-                    info.white_clock = white_secs as f64;
-                    info.black_clock = black_secs as f64;
-                    info.side_to_move = side_from_fen(&fen);
-                    info.last_update = Instant::now();
+                    if let Some(info) = &mut self.live_info {
+                        info.white_clock = white_secs as f64;
+                        info.black_clock = black_secs as f64;
+                        info.side_to_move = side;
+                        info.last_update = Instant::now();
+                        if terminal || white_secs == 0 || black_secs == 0 {
+                            info.game_over = true;
+                        }
+                    }
                 }
             }
+        }
+
+        // A network event updated the board or clocks, so we need a new frame
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let mut needs_redraw = false;
+
         match event {
             WindowEvent::CloseRequested => {
                 self.renderer = None;
@@ -273,13 +297,19 @@ impl ApplicationHandler<NetEvent> for App {
                     rend.resize(size);
                     self.ui.layout(size.width.max(1) as f32, size.height.max(1) as f32);
                 }
+                needs_redraw = true;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                // Only redraw on mouse move if we need to update the promotion hover highlight
+                if self.ui.promotion_open() {
+                    needs_redraw = true;
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let (x, y) = self.cursor_pos;
                 self.handle_board_click(x as f32, y as f32);
+                needs_redraw = true;
             }
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
@@ -288,30 +318,34 @@ impl ApplicationHandler<NetEvent> for App {
                     ..
                 },
                 ..
-            } => match code {
-                KeyCode::KeyL => {
-                    self.mode = Mode::Live;
-                    self.ui.clear_selection();
-                    self.ui.clear_promotion();
-                    self.ui.set_checked_king(None);
+            } => {
+                match code {
+                    KeyCode::KeyL => {
+                        self.mode = Mode::Live;
+                        self.ui.clear_selection();
+                        self.ui.clear_promotion();
+                        self.ui.set_checked_king(None);
+                        needs_redraw = true;
+                    }
+                    KeyCode::KeyP => {
+                        self.mode = Mode::Local;
+                        self.refresh_check_highlight();
+                        needs_redraw = true;
+                    }
+                    KeyCode::Escape => {
+                        self.ui.close_promotion();
+                        needs_redraw = true;
+                    }
+                    _ => {}
                 }
-                KeyCode::KeyP => {
-                    self.mode = Mode::Local;
-                    self.refresh_check_highlight();
-                }
-                KeyCode::Escape => {
-                    // Dismiss the promotion menu, leaving the pawn selected.
-                    self.ui.close_promotion();
-                }
-                _ => {}
-            },
+            }
             WindowEvent::RedrawRequested => {
                 let texts = self.build_texts();
                 let cursor = Some((self.cursor_pos.0 as f32, self.cursor_pos.1 as f32));
                 let mut quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
                     renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color }
                 }).collect();
-                // Promotion menu on top of the board squares.
+
                 for r in self.ui.promotion_quads(cursor) {
                     quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
                 }
@@ -353,8 +387,12 @@ impl ApplicationHandler<NetEvent> for App {
             }
             _ => {}
         }
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+
+        // ONLY request a redraw if visual state actually changed
+        if needs_redraw {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
     }
 }
