@@ -71,6 +71,12 @@ We rasterize glyphs (ASCII + chess piece Unicode) into a single GPU texture atla
 using `ab_glyph` and draw them as textured quads. This powers both text and pieces.
 Don't reach for an external text/GUI library — extend the existing pipeline.
 
+### 7. Board layout reserves a coordinate gutter
+The board is 72% of the smaller window dimension (not 80%). The extra margin holds
+the a–h file labels under the board and keeps player info clear of them.
+`UI::coordinate_gutter()` reports the reserved band, and the promotion menu skips
+it when docking below the board. Keep these in sync if the board ratio changes.
+
 ## Coding Conventions
 
 - **Complete files over patches.** When modifying, provide the full file so changes
@@ -99,8 +105,8 @@ Real-time NDJSON streaming (replaced polling)
 Clocks + player names/ratings
 Pawn promotion menu (interactive, tested)
 CPU fix: event-driven rendering
-Up next:
 Board coordinates (a–h, 1–8)
+Up next:
 Interaction polish
 Actual playable games (Lichess API token auth + Board API)
 

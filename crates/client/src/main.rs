@@ -67,6 +67,10 @@ fn format_clock(secs: f64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
+/// Muted tan-grey: readable on the #302E2C background without pulling
+/// attention away from the board.
+const COORD_COLOR: [f32; 4] = [0.62, 0.59, 0.53, 1.0];
+
 impl App {
     fn refresh_check_highlight(&mut self) {
         let checked = if self.board.in_check(self.side) {
@@ -79,12 +83,53 @@ impl App {
 
     fn build_texts(&self) -> Vec<renderer::TextElement> {
         let mut texts = Vec::new();
-        if self.mode != Mode::Live {
-            return texts;
+        self.push_coordinates(&mut texts);
+        if self.mode == Mode::Live {
+            self.push_player_info(&mut texts);
         }
+        texts
+    }
+
+    /// File labels (a-h) under the board and rank labels (1-8) beside its
+    /// left edge, each centered on its column/row. Rank 1 is at the bottom,
+    /// matching White's perspective.
+    fn push_coordinates(&self, texts: &mut Vec<renderer::TextElement>) {
+        let sq = self.ui.square_size();
+        if sq <= 0.0 {
+            return;
+        }
+        let (ox, oy) = self.ui.board_offset();
+        let board_px = sq * 8.0;
+        let size = sq * 0.3;
+
+        for file in 0..8u8 {
+            texts.push(renderer::TextElement {
+                text: ((b'a' + file) as char).to_string(),
+                x: ox + (file as f32 + 0.5) * sq,
+                y: oy + board_px + size * 1.1,
+                size,
+                color: COORD_COLOR,
+                align: renderer::TextAlign::Center,
+            });
+        }
+
+        for rank in 0..8u8 {
+            texts.push(renderer::TextElement {
+                text: ((b'1' + rank) as char).to_string(),
+                x: ox - sq * 0.45,
+                y: oy + (7.0 - rank as f32 + 0.5) * sq + size * 0.35,
+                size,
+                color: COORD_COLOR,
+                align: renderer::TextAlign::Center,
+            });
+        }
+    }
+
+    /// Player names, ratings and clocks for the live game.
+    fn push_player_info(&self, texts: &mut Vec<renderer::TextElement>) {
         let info = match &self.live_info {
             Some(i) => i,
-            None => return texts,
+            None => return,
         };
 
         let sq = self.ui.square_size();
@@ -125,8 +170,8 @@ impl App {
             align: renderer::TextAlign::Right,
         });
 
-        // White bar (below the board)
-        let bottom_y = oy + board_px + font_size * 1.1;
+        // White bar (below the board and clear of the file labels)
+        let bottom_y = oy + board_px + self.ui.coordinate_gutter() + font_size * 0.6;
         texts.push(renderer::TextElement {
             text: format!("{} ({})", info.white_name, info.white_rating),
             x: left, y: bottom_y, size: font_size, color: white,
@@ -137,8 +182,6 @@ impl App {
             x: right, y: bottom_y, size: font_size, color: white,
             align: renderer::TextAlign::Right,
         });
-
-        texts
     }
 
     /// Play a completed promotion and return to normal play.
@@ -650,5 +693,91 @@ mod tests {
         assert!(!app.ui.promotion_open());
         assert!(app.board.piece_at(d4).is_some());
         assert_eq!(app.side, chess::Color::Black);
+    }
+
+    /// Text element whose contents match `needle`.
+    fn text_named<'a>(texts: &'a [renderer::TextElement], needle: &str) -> &'a renderer::TextElement {
+        texts
+            .iter()
+            .find(|t| t.text == needle)
+            .unwrap_or_else(|| panic!("missing text {needle:?}"))
+    }
+
+    fn app_with_live_game() -> App {
+        let mut app = app_with_promoting_pawn();
+        app.mode = Mode::Live;
+        app.live_board = Some(chess::Board::starting_position());
+        app.live_info = Some(LiveGameInfo {
+            white_name: "White".to_string(),
+            black_name: "Black".to_string(),
+            white_rating: 1500,
+            black_rating: 1600,
+            white_clock: 300.0,
+            black_clock: 300.0,
+            side_to_move: chess::Color::White,
+            last_update: Instant::now(),
+            game_over: false,
+        });
+        app
+    }
+
+    #[test]
+    fn coordinates_render_in_both_modes() {
+        let local = app_with_promoting_pawn();
+        let live = app_with_live_game();
+
+        for app in [&local, &live] {
+            let texts = app.build_texts();
+            for file in 0..8u8 {
+                let label = ((b'a' + file) as char).to_string();
+                assert!(texts.iter().any(|t| t.text == label), "missing file {label}");
+            }
+            for rank in 0..8u8 {
+                let label = ((b'1' + rank) as char).to_string();
+                assert!(texts.iter().any(|t| t.text == label), "missing rank {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn coordinates_align_with_the_board() {
+        let app = app_with_live_game();
+        let texts = app.build_texts();
+        let (ox, oy) = app.ui.board_offset();
+        let sq = app.ui.square_size();
+        let size = sq * 0.3;
+
+        for file in 0..8u8 {
+            let label = ((b'a' + file) as char).to_string();
+            let t = text_named(&texts, &label);
+            assert!((t.x - (ox + (file as f32 + 0.5) * sq)).abs() < 0.001, "{label} not centered on its column");
+            assert!((t.y - (oy + sq * 8.0 + size * 1.1)).abs() < 0.001, "{label} not below the board");
+            assert!(matches!(t.align, renderer::TextAlign::Center));
+        }
+
+        for rank in 0..8u8 {
+            let label = ((b'1' + rank) as char).to_string();
+            let t = text_named(&texts, &label);
+            let row_center = oy + (7.0 - rank as f32 + 0.5) * sq;
+            assert!((t.y - (row_center + size * 0.35)).abs() < 0.001, "{label} not centered on its row");
+            assert!(t.x < ox, "{label} should sit left of the board");
+            assert!(matches!(t.align, renderer::TextAlign::Center));
+        }
+    }
+
+    #[test]
+    fn player_info_sits_below_the_file_labels() {
+        let app = app_with_live_game();
+        let texts = app.build_texts();
+        let (_, oy) = app.ui.board_offset();
+        let sq = app.ui.square_size();
+        let board_bottom = oy + sq * 8.0;
+
+        let white = text_named(&texts, "White (1500)");
+        assert!(white.y >= board_bottom + app.ui.coordinate_gutter());
+
+        let file = text_named(&texts, "a");
+        let file_bottom = file.y + file.size * 0.25; // allow for a descender
+        assert!(file_bottom < white.y - white.size * 0.7, "file labels and player info overlap");
     }
 }
