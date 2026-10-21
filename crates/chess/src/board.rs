@@ -12,6 +12,14 @@ pub enum GameStatus {
     Ongoing,
     Checkmate(Color), // the winner
     Stalemate,
+    /// Draw: 100 half-moves (50 full moves) without a pawn move or capture.
+    FiftyMoveRule,
+    /// Draw: the identical position (same pieces, side to move, castling
+    /// rights, and en passant availability) occurred three times.
+    ThreefoldRepetition,
+    /// Draw: neither side can force mate (K vs K, K+N vs K, K+B vs K,
+    /// all bishops on the board being on one square colour).
+    InsufficientMaterial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,20 +64,79 @@ const QUEEN_DIRS: [(i32, i32); 8] = [
     (1, 1), (1, -1), (-1, 1), (-1, -1),
 ];
 
+/// Compact fingerprint of a position for repetition detection: the squares,
+/// the side to move, the castling rights, and the en passant target — but the
+/// latter only when a capture is actually possible, since per the repetition
+/// rule that is what makes positions "the same".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PositionKey {
+    // 64 squares + side to move + castling bits + en passant square index.
+    data: [u8; 67],
+}
+
+impl PositionKey {
+    const NO_EP: u8 = u8::MAX;
+
+    fn new(board: &Board) -> Self {
+        let mut data = [0u8; 67];
+        for (i, slot) in board.squares.iter().enumerate() {
+            data[i] = match slot {
+                Some(p) => 1 + (p.color as u8) * 6 + match p.kind {
+                    PieceKind::Pawn => 0,
+                    PieceKind::Knight => 1,
+                    PieceKind::Bishop => 2,
+                    PieceKind::Rook => 3,
+                    PieceKind::Queen => 4,
+                    PieceKind::King => 5,
+                },
+                None => 0,
+            };
+        }
+        data[64] = match board.side_to_move {
+            Color::White => 0,
+            Color::Black => 1,
+        };
+        data[65] = (board.castling.white_kingside as u8)
+            | ((board.castling.white_queenside as u8) << 1)
+            | ((board.castling.black_kingside as u8) << 2)
+            | ((board.castling.black_queenside as u8) << 3);
+        data[66] = match board.en_passant {
+            Some(sq) if board.en_passant_capturable(sq, board.side_to_move) => sq.index() as u8,
+            _ => Self::NO_EP,
+        };
+        PositionKey { data }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Board {
     squares: [Option<Piece>; 64],
     castling: CastlingRights,
     en_passant: Option<Square>,
+    /// Half-moves since the last pawn move or capture (50-move rule counter).
+    halfmove_clock: u32,
+    /// Full move number, incremented after each black move (FEN field 6).
+    fullmove_number: u32,
+    /// The side that makes the next move.
+    side_to_move: Color,
+    /// Fingerprints of every position reached so far, including the current
+    /// one — the basis of the threefold-repetition rule.
+    history: Vec<PositionKey>,
 }
 
 impl Board {
     pub fn empty() -> Self {
-        Board {
+        let mut board = Board {
             squares: [None; 64],
             castling: CastlingRights::none(),
             en_passant: None,
-        }
+            halfmove_clock: 0,
+            fullmove_number: 1,
+            side_to_move: Color::White,
+            history: Vec::new(),
+        };
+        board.history.push(PositionKey::new(&board));
+        board
     }
 
     pub fn all_legal_moves(&self, side: Color) -> Vec<Move> {
@@ -253,13 +320,88 @@ impl Board {
     }
 
     pub fn status(&self, side_to_move: Color) -> GameStatus {
-        if self.has_legal_moves(side_to_move) {
-            GameStatus::Ongoing
-        } else if self.in_check(side_to_move) {
-            GameStatus::Checkmate(side_to_move.opposite())
+        // Mate and stalemate end the game before any draw condition applies.
+        if !self.has_legal_moves(side_to_move) {
+            if self.in_check(side_to_move) {
+                GameStatus::Checkmate(side_to_move.opposite())
+            } else {
+                GameStatus::Stalemate
+            }
+        } else if self.insufficient_material() {
+            GameStatus::InsufficientMaterial
+        } else if self.halfmove_clock >= 100 {
+            GameStatus::FiftyMoveRule
+        } else if self.position_repeated() {
+            GameStatus::ThreefoldRepetition
         } else {
-            GameStatus::Stalemate
+            GameStatus::Ongoing
         }
+    }
+
+    /// Whether the current position has occurred three or more times.
+    fn position_repeated(&self) -> bool {
+        let current = match self.history.last() {
+            Some(key) => *key,
+            None => return false,
+        };
+        self.history.iter().filter(|k| **k == current).count() >= 3
+    }
+
+    /// Standard "not enough material to force mate" verdicts, as judged on
+    /// Lichess: K vs K, K+N vs K, K+B vs K, and any number of bishops when
+    /// they all stand on the same square colour.
+    pub fn insufficient_material(&self) -> bool {
+        let mut knights = 0u8;
+        let mut light = 0u8;
+        let mut dark = 0u8;
+        for (sq, piece) in self.iter() {
+            match piece.kind {
+                PieceKind::King => {}
+                PieceKind::Pawn | PieceKind::Rook | PieceKind::Queen => return false,
+                PieceKind::Knight => knights += 1,
+                PieceKind::Bishop => {
+                    // A square is light when file + rank is odd (a1 is dark).
+                    if (sq.file() as u32 + sq.rank() as u32) % 2 == 1 {
+                        light += 1;
+                    } else {
+                        dark += 1;
+                    }
+                }
+            }
+        }
+        if knights == 0 {
+            // All bishops (if any) need to share a square colour.
+            light == 0 || dark == 0
+        } else {
+            // K+N vs K cannot mate; anything beyond that (K+N+N, K+N+B...)
+            // has line-of-sight mates available.
+            knights == 1 && light + dark == 0
+        }
+    }
+
+    /// Whether a pawn of `side` could actually capture en passant on `to`.
+    /// Only then does the en passant state matter for repetition counting.
+    fn en_passant_capturable(&self, to: Square, side: Color) -> bool {
+        let pawn_rank = match side {
+            // The capturing pawn sits on the rank just below (above) the
+            // en passant target square.
+            Color::White => to.rank().checked_sub(1),
+            Color::Black => to.rank().checked_add(1),
+        };
+        let Some(rank) = pawn_rank else { return false };
+        for df in [-1i32, 1] {
+            let file = to.file() as i32 + df;
+            if !(0..8).contains(&file) {
+                continue;
+            }
+            if self
+                .piece_at(Square::from_file_rank(file as u8, rank).unwrap())
+                == Some(Piece::new(PieceKind::Pawn, side))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn make_move(&mut self, mv: Move) {
@@ -275,6 +417,8 @@ impl Board {
             && self.piece_at(mv.to).is_none();
         let is_castle = piece.kind == PieceKind::King
             && (mv.to.file() as i32 - mv.from.file() as i32).abs() == 2;
+
+        let is_capture = self.piece_at(mv.to).is_some() || is_en_passant;
 
         // En passant removes the pawn that double-pushed (it sits beside the target).
         if is_en_passant {
@@ -333,6 +477,23 @@ impl Board {
         }
         self.revoke_rights_for_corner(mv.from);
         self.revoke_rights_for_corner(mv.to);
+
+        // 50-move clock: a pawn move or a capture resets it, anything else
+        // advances it by one half-move.
+        if is_pawn || is_capture {
+            self.halfmove_clock = 0;
+        } else {
+            self.halfmove_clock += 1;
+        }
+
+        // A full move ends with black's move.
+        if self.side_to_move == Color::Black {
+            self.fullmove_number += 1;
+        }
+        self.side_to_move = self.side_to_move.opposite();
+
+        // Record the resulting position for repetition checks.
+        self.history.push(PositionKey::new(self));
     }
 
     fn revoke_rights_for_corner(&mut self, sq: Square) {
@@ -653,7 +814,33 @@ impl Board {
             None
         };
 
-        Some(Board { squares, castling, en_passant })
+        let mut side_to_move = Color::White;
+        if let Some(field) = fields.get(1) {
+            side_to_move = match *field {
+                "w" => Color::White,
+                "b" => Color::Black,
+                _ => return None,
+            };
+        }
+        // Counters may be absent in hand-written test FENs.
+        let halfmove_clock = fields.get(4).and_then(|f| f.parse::<u32>().ok()).unwrap_or(0);
+        let fullmove_number = fields
+            .get(5)
+            .and_then(|f| f.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1);
+
+        let mut board = Board {
+            squares,
+            castling,
+            en_passant,
+            halfmove_clock,
+            fullmove_number,
+            side_to_move,
+            history: Vec::new(),
+        };
+        board.history.push(PositionKey::new(&board));
+        Some(board)
     }
 
     fn parse_square(s: &str) -> Option<Square> {
@@ -666,6 +853,88 @@ impl Board {
             return None;
         }
         Square::from_file_rank(file, rank)
+    }
+
+    /// Serialise the full board state to FEN: piece placement, side to move,
+    /// castling rights, en passant target, and both move counters.
+    pub fn to_fen(&self) -> String {
+        let mut fen = String::with_capacity(90);
+        for rank in (0..8u8).rev() {
+            let mut empties = 0u8;
+            for file in 0..8u8 {
+                match self.piece_at(Square::from_file_rank(file, rank).unwrap()) {
+                    Some(piece) => {
+                        if empties > 0 {
+                            fen.push((b'0' + empties) as char);
+                            empties = 0;
+                        }
+                        fen.push(Self::fen_char(piece));
+                    }
+                    None => empties += 1,
+                }
+            }
+            if empties > 0 {
+                fen.push((b'0' + empties) as char);
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+
+        fen.push(' ');
+        fen.push(match self.side_to_move {
+            Color::White => 'w',
+            Color::Black => 'b',
+        });
+
+        fen.push(' ');
+        let mut rights = String::new();
+        if self.castling.white_kingside {
+            rights.push('K');
+        }
+        if self.castling.white_queenside {
+            rights.push('Q');
+        }
+        if self.castling.black_kingside {
+            rights.push('k');
+        }
+        if self.castling.black_queenside {
+            rights.push('q');
+        }
+        if rights.is_empty() {
+            rights.push('-');
+        }
+        fen.push_str(&rights);
+
+        fen.push(' ');
+        match self.en_passant {
+            Some(sq) => {
+                fen.push((b'a' + sq.file()) as char);
+                fen.push((b'1' + sq.rank()) as char);
+            }
+            None => fen.push('-'),
+        }
+
+        fen.push(' ');
+        fen.push_str(&self.halfmove_clock.to_string());
+        fen.push(' ');
+        fen.push_str(&self.fullmove_number.to_string());
+        fen
+    }
+
+    fn fen_char(piece: Piece) -> char {
+        let lower = match piece.kind {
+            PieceKind::Pawn => 'p',
+            PieceKind::Knight => 'n',
+            PieceKind::Bishop => 'b',
+            PieceKind::Rook => 'r',
+            PieceKind::Queen => 'q',
+            PieceKind::King => 'k',
+        };
+        match piece.color {
+            Color::White => lower.to_ascii_uppercase(),
+            Color::Black => lower,
+        }
     }
 }
 
@@ -891,5 +1160,100 @@ mod tests {
     #[test]
     fn starting_position_is_ongoing() {
         assert_eq!(Board::starting_position().status(Color::White), GameStatus::Ongoing);
+    }
+
+    /// Star a placement into a full plain FEN, for compact draw tests.
+    fn bare(placement: &str) -> Board {
+        Board::from_fen(&format!("{} w - - 0 1", placement)).unwrap()
+    }
+
+    /// (half-move clock, full-move number) from a board's FEN.
+    fn counters(board: &Board) -> (u32, u32) {
+        let fen = board.to_fen();
+        let fields: Vec<&str> = fen.split_whitespace().collect();
+        (fields[4].parse().unwrap(), fields[5].parse().unwrap())
+    }
+
+    #[test]
+    fn fen_roundtrip_with_counters() {
+        let after = Board::starting_position().apply_san_moves("e4 e5 Nf3 Nc6", Color::White);
+        let fen = after.to_fen();
+        // e4/e5 are pawn moves (clock reset twice), Nf3/Nc6 advance it by one
+        // each; two black moves moved the full move number from 1 to 3.
+        assert!(fen.contains(" w KQkq - "), "side, rights and no ep: {}", fen);
+        assert!(fen.ends_with(" 2 3"), "counters, got: {}", fen);
+        assert_eq!(Board::from_fen(&fen).unwrap().to_fen(), fen, "roundtrip");
+
+        // A custom clock and move number survive a round trip too.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 100 30").unwrap();
+        assert_eq!(board.to_fen(), "4k3/8/8/8/8/8/8/4K3 w - - 100 30");
+    }
+
+    #[test]
+    fn move_counters_track_the_50_move_rule_inputs() {
+        let start = Board::starting_position();
+        assert_eq!(counters(&start), (0, 1));
+
+        // Two quiet knight moves: clock 2, one black move played.
+        let knights = start.apply_san_moves("Nf3 Nf6", Color::White);
+        assert_eq!(counters(&knights), (2, 2));
+
+        // Then a pawn exchange resets the clock to zero.
+        let pawns = knights.apply_san_moves("b3 b6 g3 g6", Color::White);
+        assert_eq!(counters(&pawns), (0, 4));
+    }
+
+    #[test]
+    fn capture_resets_halfmove_clock() {
+        let board = Board::from_fen("4k3/8/8/4p3/8/8/4R3/4K3 w - - 5 1").unwrap();
+        assert_eq!(counters(&board), (5, 1));
+        let after = board.apply_san_moves("Rxe5", Color::White);
+        assert_eq!(counters(&after), (0, 1));
+    }
+
+    #[test]
+    fn insufficient_material_verdicts() {
+        // K vs K and K+N vs K are dead positions.
+        assert!(bare("4k3/8/8/8/8/8/8/4K3").insufficient_material());
+        assert!(bare("4k3/8/8/8/8/8/8/3NK3").insufficient_material());
+        // Two knights: checkmate is still possible, so that is material.
+        assert!(!bare("4k3/8/8/8/8/8/8/3NKN2").insufficient_material());
+        assert!(!bare("4k3/8/8/8/8/8/8/4KQ2").insufficient_material());
+        assert!(!bare("4k3/8/8/8/4P3/8/8/4K3").insufficient_material());
+
+        // All bishops on one square colour can never mate.
+        // c1 and f8 are both dark squares (a1 is dark; file+rank even).
+        assert!(bare("5b2/8/8/8/8/8/8/2BK4").insufficient_material());
+        // Bishops on opposite colours: c1 dark, a8 light -> mating lines exist.
+        assert!(!bare("b7/8/8/8/8/8/8/2BK4").insufficient_material());
+    }
+
+    #[test]
+    fn fifty_move_rule_status() {
+        // Rook material rules out insufficient material, so the rule applies.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/4K1R1 w - - 100 30").unwrap();
+        assert_eq!(board.status(Color::White), GameStatus::FiftyMoveRule);
+        // Ninety-nine half-moves is not yet fifty full moves.
+        let early = Board::from_fen("4k3/8/8/8/8/8/8/4K1R1 w - - 99 30").unwrap();
+        assert_eq!(early.status(Color::White), GameStatus::Ongoing);
+    }
+
+    #[test]
+    fn threefold_repetition_detected() {
+        let thrice = Board::starting_position()
+            .apply_san_moves("Nf3 Nf6 Ng1 Ng8 Nf3 Nf6 Ng1 Ng8", Color::White);
+        assert_eq!(thrice.status(Color::White), GameStatus::ThreefoldRepetition);
+
+        // Twice is not a draw.
+        let twice =
+            Board::starting_position().apply_san_moves("Nf3 Nf6 Ng1 Ng8", Color::White);
+        assert_eq!(twice.status(Color::White), GameStatus::Ongoing);
+    }
+
+    #[test]
+    fn mate_takes_precedence_over_draws() {
+        // Back-rank mate with an exhausted 50-move clock.
+        let mate = Board::from_fen("k7/QK6/8/8/8/8/8/8 b - - 100 30").unwrap();
+        assert_eq!(mate.status(Color::Black), GameStatus::Checkmate(Color::White));
     }
 }

@@ -463,6 +463,9 @@ impl ApplicationHandler<NetEvent> for App {
                         chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
                         chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
                         chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
+                        chess::GameStatus::FiftyMoveRule => Some("Draw - 50-move rule"),
+                        chess::GameStatus::ThreefoldRepetition => Some("Draw - threefold repetition"),
+                        chess::GameStatus::InsufficientMaterial => Some("Draw - insufficient material"),
                         chess::GameStatus::Ongoing => None,
                     }
                 } else {
