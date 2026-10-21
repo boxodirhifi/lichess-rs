@@ -26,6 +26,18 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// The Board API game stream 404s for challenges the opponent has not
+    /// accepted yet; workers use this to distinguish "still waiting" from
+    /// real failures.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Error::Http(e) if matches!(e.as_ref(), ureq::Error::Status(404, _))
+        )
+    }
+}
+
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
         Error::Http(Box::new(e))

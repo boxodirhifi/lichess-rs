@@ -7,6 +7,30 @@ pub struct Move {
     pub promotion: Option<PieceKind>,
 }
 
+impl Move {
+    /// UCI notation as the Lichess Board API expects ("e2e4", "e7e8q");
+    /// castling is expressed as the king's move ("e1g1"), matching
+    /// `move_from_uci`'s two-square interpretation.
+    pub fn to_uci(&self) -> String {
+        let mut uci = String::with_capacity(5);
+        uci.push((b'a' + self.from.file()) as char);
+        uci.push((b'1' + self.from.rank()) as char);
+        uci.push((b'a' + self.to.file()) as char);
+        uci.push((b'1' + self.to.rank()) as char);
+        if let Some(kind) = self.promotion {
+            uci.push(match kind {
+                PieceKind::Pawn => 'p',
+                PieceKind::Knight => 'n',
+                PieceKind::Bishop => 'b',
+                PieceKind::Rook => 'r',
+                PieceKind::Queen => 'q',
+                PieceKind::King => 'k',
+            });
+        }
+        uci
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameStatus {
     Ongoing,
@@ -305,6 +329,11 @@ impl Board {
 
     pub fn piece_at(&self, square: Square) -> Option<Piece> {
         self.squares[square.index()]
+    }
+
+    /// The side that makes the next move.
+    pub fn side_to_move(&self) -> Color {
+        self.side_to_move
     }
 
     pub fn set_piece(&mut self, square: Square, piece: Option<Piece>) {
@@ -1234,6 +1263,29 @@ mod tests {
         assert_eq!(n.promotion, Some(PieceKind::Knight));
         // A promotion letter with no corresponding legal move.
         assert!(board.move_from_uci("e7e8x", Color::White).is_none());
+    }
+
+    #[test]
+    fn uci_move_roundtrips() {
+        // A quiet move.
+        let mv = Board::starting_position()
+            .move_from_uci("e2e4", Color::White)
+            .unwrap();
+        assert_eq!(mv.to_uci(), "e2e4");
+
+        // Castling round-trips as the king's own move.
+        let board = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let castle = board
+            .legal_moves_from(Square::from_file_rank(4, 0).unwrap())
+            .into_iter()
+            .find(|m| m.to == Square::from_file_rank(6, 0).unwrap())
+            .unwrap();
+        assert_eq!(castle.to_uci(), "e1g1");
+
+        // Promotions keep the kind letter lower-cased.
+        let board = Board::from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1").unwrap();
+        let promo = board.move_from_uci("e7e8n", Color::White).unwrap();
+        assert_eq!(promo.to_uci(), "e7e8n");
     }
 
     #[test]

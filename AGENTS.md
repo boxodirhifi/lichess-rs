@@ -114,6 +114,7 @@ Pawn promotion menu (interactive, tested)
 CPU fix: event-driven rendering
 Board coordinates (a–h, 1–8)
 Draw rules: threefold repetition, 50-move rule, insufficient material, halfmove/fullmove counters + `to_fen`
+Online play: Board API (token auth, challenge a friend, NDJSON game stream, UCI replay + move posting)
 Up next:
 Interaction polish
 Actual playable games (Lichess API token auth + Board API)

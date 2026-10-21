@@ -22,12 +22,67 @@ pub enum NetEvent {
         white_secs: u32,
         black_secs: u32,
     },
+    /// Token validated; carries the account name.
+    OnlineReady {
+        username: String,
+    },
+    /// A Board API game (accepted challenge) is set up.
+    OnlineFull {
+        game_id: String,
+        initial_fen: Option<String>,
+        white_name: String,
+        white_rating: u32,
+        black_name: String,
+        black_rating: u32,
+        moves: String,
+        wtime_ms: u64,
+        btime_ms: u64,
+        status: String,
+        winner: Option<chess::Color>,
+    },
+    /// Incremental Board API state update.
+    OnlineState {
+        moves: String,
+        wtime_ms: u64,
+        btime_ms: u64,
+        status: String,
+        winner: Option<chess::Color>,
+    },
+    OnlineFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Local,
     Live,
+    /// Online play through the Board API (challenge a friend and play).
+    Play,
+}
+
+/// An online game in progress.
+struct OnlineGame {
+    game_id: String,
+    board: chess::Board,
+    my_color: chess::Color,
+    white_name: String,
+    black_name: String,
+    white_rating: u32,
+    black_rating: u32,
+    white_clock: f64,
+    black_clock: f64,
+    last_update: Instant,
+    game_over: bool,
+    winner: Option<chess::Color>,
+}
+
+enum Online {
+    Idle,
+    /// Challenge created, waiting for the opponent's acceptance.
+    Waiting,
+    /// Boxed: the running game is much larger than the marker variants.
+    Active(Box<OnlineGame>),
 }
 
 struct LiveGameInfo {
@@ -43,16 +98,22 @@ struct LiveGameInfo {
 }
 
 struct App {
+    /// Event proxy for spawning online-play workers; `None` in unit tests.
+    proxy: Option<EventLoopProxy<NetEvent>>,
     renderer: Option<renderer::Renderer>,
     window: Option<Arc<Window>>,
     ui: ui::UI,
     board: chess::Board,
     live_board: Option<chess::Board>,
     live_info: Option<LiveGameInfo>,
-    side: chess::Color,
-    status: chess::GameStatus,
     mode: Mode,
     cursor_pos: (f64, f64),
+    side: chess::Color,
+    status: chess::GameStatus,
+    token: Option<String>,
+    my_username: Option<String>,
+    online: Online,
+    online_error: Option<String>,
 }
 
 fn side_from_fen(fen: &str) -> chess::Color {
@@ -82,6 +143,33 @@ fn coord_color(file: u8, rank: u8) -> [f32; 4] {
 }
 
 impl App {
+    /// Kick off the online flow: read the token, read the opponent, and hand
+    /// the long-running work (challenge creation + game stream) to a worker
+    /// thread. Guards against double-starting while one is running.
+    fn start_online_challenge(&mut self) {
+        if !matches!(self.online, Online::Idle) {
+            return;
+        }
+        let Some(token) = lichess::read_token() else {
+            self.online_error = Some(
+                "No API token — set LICHESS_API_TOKEN or ~/.config/lichess-rs/token".to_string(),
+            );
+            return;
+        };
+        let Some(opponent) = read_opponent() else {
+            self.online_error = Some(
+                "No opponent — set LICHESS_OPPONENT or ~/.config/lichess-rs/opponent".to_string(),
+            );
+            return;
+        };
+        self.token = Some(token.clone());
+        self.online = Online::Waiting;
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        std::thread::spawn(move || online_worker(proxy, token, opponent));
+    }
+
     fn refresh_check_highlight(&mut self) {
         let checked = if self.board.in_check(self.side) {
             self.board.king_square(self.side)
@@ -97,24 +185,120 @@ impl App {
         if self.mode == Mode::Live {
             self.push_player_info(&mut texts);
         }
+        if self.mode == Mode::Play {
+            self.push_online_info(&mut texts);
+        }
         texts
     }
 
-    /// While spectating a live game whose clocks are still running, the clock
-    /// display subtracts elapsed time at redraw time — so unless a redraw is
-    /// scheduled, the clocks would appear frozen between server updates
-    /// (e.g. all through a 10+0 thinking streak). Returns the next whole-second
-    /// boundary on which the clock bar should be redrawn, or `None` when no
-    /// ticking is possible (not live, no game info, or game over).
+    /// Player bars for the online game, black above the board and white
+    /// below it, in the same style as the spectator bars.
+    fn push_online_info(&self, texts: &mut Vec<renderer::TextElement>) {
+        let game = match &self.online {
+            Online::Active(game) => game,
+            _ => return,
+        };
+
+        let sq = self.ui.square_size();
+        let board_px = sq * 8.0;
+        let (ox, oy) = self.ui.board_offset();
+        let left = ox;
+        let right = ox + board_px;
+        let font_size = (sq * 0.35).max(14.0);
+        let white = [1.0, 1.0, 1.0, 1.0];
+
+        // Same server-truth freeze rule as spectating.
+        let elapsed = if game.game_over {
+            0.0
+        } else {
+            game.last_update.elapsed().as_secs_f64()
+        };
+        let white_clock = if game.board.side_to_move() == chess::Color::White {
+            (game.white_clock - elapsed).max(0.0)
+        } else {
+            game.white_clock
+        };
+        let black_clock = if game.board.side_to_move() == chess::Color::Black {
+            (game.black_clock - elapsed).max(0.0)
+        } else {
+            game.black_clock
+        };
+
+        let mine = |name: &str| -> bool {
+            self.my_username
+                .as_deref()
+                .map(|user| user.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        };
+        let label = |name: &str, rating: u32| -> String {
+            let star = if mine(name) { " *" } else { "" };
+            format!("{name} ({rating}){star}")
+        };
+
+        // Black's bar sits above the board, white's below it.
+        let bars = [
+            (
+                game.black_name.clone(),
+                game.black_rating,
+                black_clock,
+                left,
+                oy - font_size * 0.4,
+            ),
+            (
+                game.white_name.clone(),
+                game.white_rating,
+                white_clock,
+                left,
+                oy + board_px + font_size * 1.1,
+            ),
+        ];
+        for (name, rating, clock, label_x, y) in bars {
+            texts.push(renderer::TextElement {
+                text: label(&name, rating),
+                x: label_x,
+                y,
+                size: font_size,
+                color: white,
+                align: renderer::TextAlign::Left,
+                shadow: false,
+            });
+            texts.push(renderer::TextElement {
+                text: format_clock(clock),
+                x: right,
+                y,
+                size: font_size,
+                color: white,
+                align: renderer::TextAlign::Right,
+                shadow: false,
+            });
+        }
+    }
+
+    /// The clock display subtracts elapsed time at redraw time — so unless a
+    /// redraw is scheduled, clocks would appear frozen between board/network
+    /// updates (e.g. all through a 10+0 thinking streak). Returns the next
+    /// whole-second boundary on which the tick bar should be redrawn, in both
+    /// spectator and online-play mode; `None` when nothing can tick.
     fn next_clock_tick(&self) -> Option<Instant> {
-        if self.mode != Mode::Live {
-            return None;
-        }
-        let info = self.live_info.as_ref()?;
-        if info.game_over {
-            return None;
-        }
-        Some(info.last_update + Duration::from_secs(info.last_update.elapsed().as_secs() + 1))
+        let candidates = [
+            match &self.live_info {
+                Some(info) if self.mode == Mode::Live && !info.game_over => Some(&info.last_update),
+                _ => None,
+            },
+            match &self.online {
+                Online::Active(game) if self.mode == Mode::Play && !game.game_over => {
+                    Some(&game.last_update)
+                }
+                _ => None,
+            },
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .map(|last_update| {
+                *last_update + Duration::from_secs(last_update.elapsed().as_secs() + 1)
+            })
+            .min()
     }
 
     /// Lichess-style in-square coordinates: file letters in the bottom-left
@@ -223,29 +407,76 @@ impl App {
     }
 
     /// Play a completed promotion and return to normal play.
+    /// Which board clicks operate on: the local one in local play, the
+    /// online one while a Board API game is running.
+    fn active_board(&mut self) -> Option<&mut chess::Board> {
+        match self.mode {
+            Mode::Local => Some(&mut self.board),
+            Mode::Play => match &mut self.online {
+                Online::Active(game) => Some(&mut game.board),
+                _ => None,
+            },
+            Mode::Live => None,
+        }
+    }
+
+    /// Post a played move to Lichess in the background; the board stream
+    /// echoes it back, so the reply only needs logging.
+    fn post_online_move(&mut self, mv: chess::Move) {
+        let game_id = self.online_game().map(|game| game.game_id.clone());
+        let Some(game_id) = game_id else { return };
+        let Some(token) = self.token.clone() else { return };
+        let uci = mv.to_uci();
+        std::thread::spawn(move || {
+            if let Err(e) = lichess::play_board_move(&token, &game_id, &uci) {
+                log::warn!("Move post failed: {}", e);
+            }
+        });
+    }
+
+    /// The running online game, if any.
+    fn online_game(&self) -> Option<&OnlineGame> {
+        match &self.online {
+            Online::Active(game) => Some(game),
+            _ => None,
+        }
+    }
+
     fn finish_promotion(&mut self, kind: chess::PieceKind) {
         let Some((from, to, _)) = self.ui.close_promotion() else {
             return;
         };
-        if let Some(mv) = self
-            .board
-            .legal_moves_from(from)
-            .into_iter()
-            .find(|m| m.to == to && m.promotion == Some(kind))
-        {
+        let Some(mv) = self
+            .active_board()
+            .and_then(|board| {
+                board
+                    .legal_moves_from(from)
+                    .into_iter()
+                    .find(|m| m.to == to && m.promotion == Some(kind))
+            })
+        else {
+            self.ui.clear_selection();
+            return;
+        };
+        self.apply_move(mv);
+        self.ui.clear_selection();
+    }
+
+    /// Apply a complete move to the active board: bookkeeping for local play,
+    /// and a background POST for online play.
+    fn apply_move(&mut self, mv: chess::Move) {
+        if self.mode == Mode::Local {
             self.board.make_move(mv);
             self.side = self.side.opposite();
             self.status = self.board.status(self.side);
             self.refresh_check_highlight();
+        } else {
+            self.post_online_move(mv);
         }
-        self.ui.clear_selection();
     }
 
     fn handle_board_click(&mut self, x: f32, y: f32) {
         if self.mode == Mode::Live {
-            return;
-        }
-        if self.status != chess::GameStatus::Ongoing {
             return;
         }
         // A click while the promotion menu is open either picks a piece or
@@ -259,6 +490,21 @@ impl App {
             }
             return;
         }
+
+        // Whose move it is, and whether moves are accepted at all: local
+        // play accepts everything until the game ends; online play only my
+        // side, only while the server says the game is still running.
+        let my_turn = match self.mode {
+            Mode::Local => self.status == chess::GameStatus::Ongoing,
+            Mode::Play => match self.online_game() {
+                Some(game) => {
+                    !game.game_over && game.board.side_to_move() == game.my_color
+                }
+                None => return,
+            },
+            Mode::Live => unreachable!(),
+        };
+
         let sq = match self.ui.square_at(x, y) {
             Some(sq) => sq,
             None => {
@@ -268,32 +514,44 @@ impl App {
         };
         if self.ui.is_move_target(sq) {
             if let Some(from) = self.ui.selected_square() {
-                let candidates: Vec<chess::Move> = self
-                    .board
-                    .legal_moves_from(from)
-                    .into_iter()
-                    .filter(|m| m.to == sq)
-                    .collect();
+                let candidates = self
+                    .active_board()
+                    .map(|board| {
+                        board
+                            .legal_moves_from(from)
+                            .into_iter()
+                            .filter(|m| m.to == sq)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let promotion = candidates.iter().any(|m| m.promotion.is_some());
-                if promotion {
+                if promotion && my_turn {
                     // Let the player pick the piece before playing the move.
-                    self.ui.open_promotion(from, sq, self.side);
+                    let mover_color = self
+                        .active_board()
+                        .and_then(|board| board.piece_at(from))
+                        .map(|piece| piece.color);
+                    if let Some(color) = mover_color {
+                        self.ui.open_promotion(from, sq, color);
+                    }
+                    // Keep the pawn selected: picking a non-menu cell then
+                    // returns to offering the remaining choices.
                     return;
-                }
-                if let Some(&mv) = candidates.first() {
-                    self.board.make_move(mv);
-                    self.side = self.side.opposite();
-                    self.status = self.board.status(self.side);
-                    self.refresh_check_highlight();
+                } else if let Some(&mv) = candidates.first() {
+                    if my_turn {
+                        self.apply_move(mv);
+                    }
                 }
             }
             self.ui.clear_selection();
             return;
         }
-        if let Some(piece) = self.board.piece_at(sq) {
-            if piece.color == self.side {
-                let mut targets: Vec<chess::Square> =
-                    self.board.legal_moves_from(sq).iter().map(|m| m.to).collect();
+        if let Some(piece) = self.active_board().and_then(|board| board.piece_at(sq)) {
+            if self.can_select_piece(piece.color) {
+                let mut targets: Vec<chess::Square> = self
+                    .active_board()
+                    .map(|board| board.legal_moves_from(sq).iter().map(|m| m.to).collect())
+                    .unwrap_or_default();
                 targets.sort_by_key(|s| s.index());
                 targets.dedup();
                 self.ui.select(sq, targets);
@@ -301,6 +559,19 @@ impl App {
             }
         }
         self.ui.clear_selection();
+    }
+
+    /// Selection rules: local play lets you pick either color; online play
+    /// only your own pieces, while it is your turn.
+    fn can_select_piece(&self, color: chess::Color) -> bool {
+        match self.mode {
+            Mode::Local => true,
+            Mode::Play => self
+                .online_game()
+                .map(|game| game.my_color == color)
+                .unwrap_or(false),
+            Mode::Live => false,
+        }
     }
 }
 
@@ -355,6 +626,64 @@ impl ApplicationHandler<NetEvent> for App {
                         }
                     }
                 }
+            }
+            NetEvent::OnlineReady { username } => {
+                self.my_username = Some(username);
+            }
+            NetEvent::OnlineFull {
+                game_id,
+                initial_fen,
+                white_name,
+                black_name,
+                white_rating,
+                black_rating,
+                moves,
+                wtime_ms,
+                btime_ms,
+                status,
+                winner,
+            } => {
+                let me = self.my_username.clone();
+                let mine = |name: &str| me.as_deref().is_some_and(|me| me.eq_ignore_ascii_case(name));
+                let my_color = if mine(&white_name) {
+                    chess::Color::White
+                } else {
+                    chess::Color::Black
+                };
+                let board = match initial_fen.as_deref().unwrap_or("startpos") {
+                    "startpos" => chess::Board::starting_position(),
+                    fen => chess::Board::from_fen(fen).unwrap_or_else(chess::Board::starting_position),
+                };
+                let mut board = board;
+                replay_uci(&mut board, &moves);
+                self.online = Online::Active(Box::new(OnlineGame {
+                    game_id,
+                    board,
+                    my_color,
+                    white_name,
+                    black_name,
+                    white_rating,
+                    black_rating,
+                    white_clock: wtime_ms as f64 / 1000.0,
+                    black_clock: btime_ms as f64 / 1000.0,
+                    last_update: Instant::now(),
+                    game_over: status != "started",
+                    winner,
+                }));
+            }
+            NetEvent::OnlineState { moves, wtime_ms, btime_ms, status, winner } => {
+                if let Online::Active(game) = &mut self.online {
+                    replay_uci(&mut game.board, &moves);
+                    game.white_clock = wtime_ms as f64 / 1000.0;
+                    game.black_clock = btime_ms as f64 / 1000.0;
+                    game.last_update = Instant::now();
+                    game.game_over = status != "started";
+                    game.winner = winner;
+                }
+            }
+            NetEvent::OnlineFailed { message } => {
+                self.online_error = Some(message);
+                self.online = Online::Idle;
             }
         }
 
@@ -432,6 +761,14 @@ impl ApplicationHandler<NetEvent> for App {
                         self.refresh_check_highlight();
                         needs_redraw = true;
                     }
+                    KeyCode::KeyC => {
+                        self.mode = Mode::Play;
+                        self.ui.clear_selection();
+                        self.ui.clear_promotion();
+                        self.online_error = None;
+                        self.start_online_challenge();
+                        needs_redraw = true;
+                    }
                     KeyCode::Escape => {
                         self.ui.close_promotion();
                         needs_redraw = true;
@@ -458,8 +795,8 @@ impl ApplicationHandler<NetEvent> for App {
                         size: c.rect.h,
                     }
                 }).collect();
-                let banner: Option<&'static str> = if self.mode == Mode::Local {
-                    match self.status {
+                let banner: Option<String> = match self.mode {
+                    Mode::Local => match self.status {
                         chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
                         chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
                         chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
@@ -468,9 +805,30 @@ impl ApplicationHandler<NetEvent> for App {
                         chess::GameStatus::InsufficientMaterial => Some("Draw - insufficient material"),
                         chess::GameStatus::Ongoing => None,
                     }
-                } else {
-                    None
+                    .map(|text| text.to_string()),
+                    Mode::Live => None,
+                    Mode::Play => {
+                        if let Some(error) = &self.online_error {
+                            Some(error.clone())
+                        } else {
+                            match &self.online {
+                                Online::Waiting => {
+                                    Some("Challenge sent - waiting for opponent to accept".to_string())
+                                }
+                                Online::Active(game) if game.game_over => {
+                                    let text = match game.winner {
+                                        Some(color) if color == game.my_color => "You win!",
+                                        Some(_) => "You lose",
+                                        None => "Drawn game",
+                                    };
+                                    Some(text.to_string())
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
                 };
+                let banner: Option<&str> = banner.as_deref();
 
                 if let Some(rend) = self.renderer.as_mut() {
                     let scene = renderer::Scene {
@@ -478,6 +836,10 @@ impl ApplicationHandler<NetEvent> for App {
                         board: match self.mode {
                             Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
                             Mode::Local => &self.board,
+                            Mode::Play => match &self.online {
+                                Online::Active(game) => &game.board,
+                                _ => &self.board,
+                            },
                         },
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
@@ -545,13 +907,137 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
     }
 }
 
+/// Opponent name: the `LICHESS_OPPONENT` environment variable first, then
+/// the first line of `~/.config/lichess-rs/opponent`.
+fn read_opponent() -> Option<String> {
+    if let Ok(name) = std::env::var("LICHESS_OPPONENT") {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|home| format!("{home}/.config")))?;
+    let file = format!("{config_home}/lichess-rs/opponent");
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|contents| contents.lines().next().map(|line| line.trim().to_string()))
+        .filter(|line| !line.is_empty())
+}
+
+/// Replay a full UCI move list (as the Board API stream sends it) onto a
+/// board, using the board's own side-to-move tracking.
+fn replay_uci(board: &mut chess::Board, moves: &str) {
+    for uci in moves.split_whitespace() {
+        let side = board.side_to_move();
+        match board.move_from_uci(uci, side) {
+            Some(mv) => board.make_move(mv),
+            None => {
+                log::warn!("UCI replay stopped at {}", uci);
+                break;
+            }
+        }
+    }
+}
+
+/// Long-running online play worker: validate the token, create the
+/// challenge, wait for acceptance, then stream the game to the event loop
+/// until it ends.
+fn online_worker(proxy: EventLoopProxy<NetEvent>, token: String, opponent: String) {
+    let me = match lichess::account_me(&token) {
+        Ok(me) => me,
+        Err(e) => {
+            let _ = proxy.send_event(NetEvent::OnlineFailed {
+                message: format!("Token check failed: {e}"),
+            });
+            return;
+        }
+    };
+    let _ = proxy.send_event(NetEvent::OnlineReady { username: me.username });
+
+    // Unrated 3+2 through the Board API.
+    let challenge = match lichess::create_challenge(&token, &opponent, false, 180, 2, None) {
+        Ok(challenge) => challenge,
+        Err(e) => {
+            let _ = proxy.send_event(NetEvent::OnlineFailed {
+                message: format!("Could not challenge {opponent}: {e}"),
+            });
+            return;
+        }
+    };
+    log::info!("Challenge {} sent to {}, streaming until accepted...", challenge.id, opponent);
+
+    // The game stream 404s until the opponent accepts; retry for a bit, then
+    // stream until (and only until) the game ends.
+    for _ in 0..90 {
+        let result = lichess::stream_board_game(&token, &challenge.id, |event| {
+            forward_board_event(&proxy, event)
+        });
+        match result {
+            Ok(()) => return, // stream closed = game over
+            Err(e) if e.is_not_found() => {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(e) => {
+                let _ = proxy.send_event(NetEvent::OnlineFailed {
+                    message: format!("Game stream failed: {e}"),
+                });
+                return;
+            }
+        }
+    }
+    let _ = proxy.send_event(NetEvent::OnlineFailed {
+        message: format!("{opponent} did not accept in time"),
+    });
+}
+
+/// Map Board API stream events onto the app's event enum.
+fn forward_board_event(proxy: &EventLoopProxy<NetEvent>, event: lichess::BoardStreamEvent) {
+    let color_of = |name: &str| match name.to_ascii_lowercase().as_str() {
+        "white" => Some(chess::Color::White),
+        "black" => Some(chess::Color::Black),
+        _ => None,
+    };
+    let send = match event {
+        lichess::BoardStreamEvent::Full(full) => Some(NetEvent::OnlineFull {
+            game_id: full.id,
+            initial_fen: full.initial_fen,
+            white_name: full.white.name,
+            white_rating: full.white.rating.unwrap_or(0),
+            black_name: full.black.name,
+            black_rating: full.black.rating.unwrap_or(0),
+            moves: full.state.moves,
+            wtime_ms: full.state.wtime,
+            btime_ms: full.state.btime,
+            status: full.state.status,
+            winner: full.state.winner.as_deref().and_then(color_of),
+        }),
+        lichess::BoardStreamEvent::State(state) => Some(NetEvent::OnlineState {
+            moves: state.moves,
+            wtime_ms: state.wtime,
+            btime_ms: state.btime,
+            status: state.status,
+            winner: state.winner.as_deref().and_then(color_of),
+        }),
+        // Chat and opponent-gone notices are out of scope for now.
+        lichess::BoardStreamEvent::Chat(_) | lichess::BoardStreamEvent::OpponentGone(_) => None,
+    };
+    if let Some(event) = send {
+        let _ = proxy.send_event(event);
+    }
+}
+
 fn main() {
     env_logger::init();
     let event_loop = EventLoop::<NetEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    let app_proxy = proxy.clone();
     std::thread::spawn(move || lichess_worker(proxy));
 
     let mut app = App {
+        proxy: Some(app_proxy),
         renderer: None,
         window: None,
         ui: ui::UI::new(),
@@ -562,6 +1048,10 @@ fn main() {
         status: chess::GameStatus::Ongoing,
         mode: Mode::Live,
         cursor_pos: (0.0, 0.0),
+        token: None,
+        my_username: None,
+        online: Online::Idle,
+        online_error: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -573,6 +1063,7 @@ mod tests {
     /// A board with a white pawn on the 7th rank, ready to promote.
     fn app_with_promoting_pawn() -> App {
         let mut app = App {
+            proxy: None,
             renderer: None,
             window: None,
             ui: ui::UI::new(),
@@ -583,6 +1074,10 @@ mod tests {
             status: chess::GameStatus::Ongoing,
             mode: Mode::Local,
             cursor_pos: (0.0, 0.0),
+            token: None,
+            my_username: None,
+            online: Online::Idle,
+            online_error: None,
         };
         app.ui.layout(800.0, 600.0);
         app
@@ -734,6 +1229,23 @@ mod tests {
             Some(chess::PieceKind::Pawn)
         ));
         assert_eq!(app.ui.selected_square(), Some(e7));
+    }
+
+    #[test]
+    fn replay_uci_applies_moves_with_side_to_move() {
+        let mut board = chess::Board::starting_position();
+        replay_uci(&mut board, "e2e4 g8f6 b1c3");
+        assert_eq!(board.side_to_move(), chess::Color::Black);
+        let c3 = chess::Square::from_file_rank(2, 2).unwrap();
+        assert_eq!(
+            board.piece_at(c3).map(|p| p.kind),
+            Some(chess::PieceKind::Knight)
+        );
+
+        // Unknown moves stop the replay instead of panicking.
+        let mut board = chess::Board::starting_position();
+        replay_uci(&mut board, "e2e4 nonsense e7e5");
+        assert_eq!(board.side_to_move(), chess::Color::Black);
     }
 
     #[test]
