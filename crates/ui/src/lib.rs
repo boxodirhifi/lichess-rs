@@ -23,6 +23,7 @@ pub struct PromotionChoice {
     pub color: chess::Color,
 }
 
+#[derive(Default)]
 pub struct UI {
     pub squares: Vec<Rect>,
     selected: Option<chess::Square>,
@@ -55,19 +56,7 @@ pub const PROMOTION_KINDS: [chess::PieceKind; 4] = [
 
 impl UI {
     pub fn new() -> Self {
-        Self {
-            squares: Vec::with_capacity(64),
-            selected: None,
-            move_targets: Vec::new(),
-            checked_king: None,
-            promotion: None,
-            screen_w: 0.0,
-            screen_h: 0.0,
-            board_px: 0.0,
-            sq_size: 0.0,
-            offset_x: 0.0,
-            offset_y: 0.0,
-        }
+        Self::default()
     }
 
     pub fn layout(&mut self, screen_w: f32, screen_h: f32) {

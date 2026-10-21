@@ -375,6 +375,9 @@ impl TextPipeline {
         w
     }
 
+    // One entry point that uploads the whole text/piece scene to the GPU;
+    // parameter count mirrors `Scene`, so it stays flat by design.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         queue: &wgpu::Queue,
@@ -445,10 +448,11 @@ impl TextPipeline {
         // same trick the Lichess/Chess.com piece sets use.
         let t = (size * 0.03).clamp(1.0, 2.5);
         let outline = piece_outline(color);
-        const RING: [(f32, f32); 8] = [
-            (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-            (0.7071, 0.7071), (0.7071, -0.7071), (-0.7071, 0.7071), (-0.7071, -0.7071),
-        ];
+        const RING: [(f32, f32); 8] = {
+            const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
+            [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+             (D, D), (D, -D), (-D, D), (-D, -D)]
+        };
         for (dx, dy) in RING {
             self.push_quad(x0 + dx * t, y0 + dy * t, w, h, uv, outline);
         }
