@@ -1,10 +1,10 @@
 use winit::application::ApplicationHandler;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum NetEvent {
@@ -98,6 +98,23 @@ impl App {
             self.push_player_info(&mut texts);
         }
         texts
+    }
+
+    /// While spectating a live game whose clocks are still running, the clock
+    /// display subtracts elapsed time at redraw time — so unless a redraw is
+    /// scheduled, the clocks would appear frozen between server updates
+    /// (e.g. all through a 10+0 thinking streak). Returns the next whole-second
+    /// boundary on which the clock bar should be redrawn, or `None` when no
+    /// ticking is possible (not live, no game info, or game over).
+    fn next_clock_tick(&self) -> Option<Instant> {
+        if self.mode != Mode::Live {
+            return None;
+        }
+        let info = self.live_info.as_ref()?;
+        if info.game_over {
+            return None;
+        }
+        Some(info.last_update + Duration::from_secs(info.last_update.elapsed().as_secs() + 1))
     }
 
     /// Lichess-style in-square coordinates: file letters in the bottom-left
@@ -344,6 +361,25 @@ impl ApplicationHandler<NetEvent> for App {
         // A network event updated the board or clocks, so we need a new frame
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
+        }
+    }
+
+    /// Runs after every dispatched event. Here we keep the event-driven rule:
+    /// when nothing needs a redraw we wait for the next real event, and the
+    /// only timer we ever arm is the once-per-second clock tick while
+    /// spectating a running game.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(deadline) = self.next_clock_tick() {
+            // The tick boundary has already passed: draw the clocks now, then
+            // re-arm the timer for the following second.
+            if Instant::now() >= deadline {
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
