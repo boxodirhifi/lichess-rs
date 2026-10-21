@@ -52,9 +52,13 @@ Stick with NDJSON unless a feature specifically requires the WebSocket.
 
 ### 3. Event-driven rendering (not a render loop)
 The app only redraws when state **actually changes** (a move arrives, the user
-interacts, the window resizes). We do **not** call `window.request_redraw()`
-unconditionally every frame — that causes an unthrottled loop and 100% CPU.
-Request redraws only in response to real changes. When idle, CPU usage should be ~0%.
+interacts, the window resizes) — including the one visible change that happens
+on a timer: while spectating a live game whose clocks are still running,
+`App::next_clock_tick()` schedules a redraw roughly every second via
+`ControlFlow::WaitUntil` so the clocks visibly tick between server updates.
+That is still event-driven (one scheduled redraw per state change), not a
+render loop. Request redraws only in response to real changes. When idle,
+CPU usage should be ~0%.
 
 ### 4. Clocks trust the server (no client interpolation)
 For spectating, we display the exact clock values the server sends rather than
@@ -71,11 +75,14 @@ We rasterize glyphs (ASCII + chess piece Unicode) into a single GPU texture atla
 using `ab_glyph` and draw them as textured quads. This powers both text and pieces.
 Don't reach for an external text/GUI library — extend the existing pipeline.
 
-### 7. Board layout reserves a coordinate gutter
-The board is 72% of the smaller window dimension (not 80%). The extra margin holds
-the a–h file labels under the board and keeps player info clear of them.
-`UI::coordinate_gutter()` reports the reserved band, and the promotion menu skips
-it when docking below the board. Keep these in sync if the board ratio changes.
+### 7. Board coordinates are drawn inside edge squares (no outer gutter)
+The board is 80% of the smaller window dimension. File letters (a–h) and rank
+numbers (1–8) are drawn *inside* the corner squares of the h-file and first
+rank (Lichess-style), tinted with the opposite colour of the square they sit
+on (see `coord_color` in `client`) so they always contrast. Because no outer
+gutter is reserved, the promotion menu may freely dock in the margin outside
+the board. If the board ratio changes, keep `UI::layout()` and the
+coordinate-gutter assumption in sync.
 
 ## Coding Conventions
 
