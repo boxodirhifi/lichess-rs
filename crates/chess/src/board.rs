@@ -472,7 +472,7 @@ impl Board {
             let h = Square::from_file_rank(7, rank).unwrap();
             let rook_ok = matches!(
                 self.piece_at(h),
-                Some(Piece { kind: PieceKind::Rook, color }) if color == color
+                Some(Piece { kind: PieceKind::Rook, color: c }) if c == color
             );
             if rook_ok && self.piece_at(f).is_none() && self.piece_at(g).is_none()
                 && !self.is_square_attacked(f, color.opposite())
@@ -490,7 +490,7 @@ impl Board {
             let a = Square::from_file_rank(0, rank).unwrap();
             let rook_ok = matches!(
                 self.piece_at(a),
-                Some(Piece { kind: PieceKind::Rook, color }) if color == color
+                Some(Piece { kind: PieceKind::Rook, color: c }) if c == color
             );
             if rook_ok && self.piece_at(b).is_none() && self.piece_at(c).is_none() && self.piece_at(d).is_none()
                 && !self.is_square_attacked(d, color.opposite())
@@ -869,6 +869,23 @@ mod tests {
         // Black king h8 is not in check but has no legal move.
         let board = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
         assert_eq!(board.status(Color::Black), GameStatus::Stalemate);
+    }
+
+    #[test]
+    fn white_cannot_castle_with_enemy_rook_on_corner() {
+        // Regression test (clippy `eq_op`): the rook check in castling-move
+        // generation compared the piece's colour to itself, so *any* rook on
+        // the corner square — including the opponent's — satisfied the
+        // conditions. Kingside squares are empty and unattacked here, and the
+        // black rook on h1 does not give check, so the bug would emit a
+        // bogus white king to g8 castle.
+        let board = Board::from_fen("4K3/8/8/8/8/8/8/7r w K - 0 1").unwrap();
+        let from = Square::from_file_rank(4, 7).unwrap(); // e8
+        let g8 = Square::from_file_rank(6, 7).unwrap();
+        assert!(
+            !board.legal_moves_from(from).iter().any(|m| m.to == g8),
+            "no kingside castle without our own rook on the corner"
+        );
     }
 
     #[test]
