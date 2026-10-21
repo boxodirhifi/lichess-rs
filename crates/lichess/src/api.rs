@@ -1,7 +1,9 @@
-use crate::types::{GameSnapshot, TvGame};
+use crate::types::{
+    Account, BoardStreamEvent, ChallengeAccepted, ChallengeCreated, GameSnapshot, TvGame,
+    TvStreamEvent,
+};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use crate::types::TvStreamEvent;
 
 const BASE: &str = "https://lichess.org";
 
@@ -75,6 +77,107 @@ pub fn stream_tv_feed(mut callback: impl FnMut(TvStreamEvent)) -> Result<(), Err
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// OAuth-protected endpoints (Board API)
+// ---------------------------------------------------------------------------
+
+/// Read an API token: the `LICHESS_API_TOKEN` environment variable first,
+/// then the first line of `~/.config/lichess-rs/token` (XDG layout).
+pub fn read_token() -> Option<String> {
+    if let Ok(token) = std::env::var("LICHESS_API_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|home| format!("{home}/.config")))?;
+    let file = format!("{config_home}/lichess-rs/token");
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|contents| contents.lines().next().map(|line| line.trim().to_string()))
+        .filter(|line| !line.is_empty())
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// Public profile of the token's account; cheap way to validate a token.
+pub fn account_me(token: &str) -> Result<Account, Error> {
+    let resp = ureq::get(&format!("{BASE}/api/account/me"))
+        .set("Authorization", &bearer(token))
+        .call()?;
+    Ok(resp.into_json()?)
+}
+
+/// Create a real-time challenge against `username`. `clock_secs` and
+/// `increment_secs` make up the time control (600/5 = "10+5"). The token
+/// needs the `challenge:write` scope; the opponent still has to accept.
+pub fn create_challenge(
+    token: &str,
+    username: &str,
+    rated: bool,
+    clock_secs: u32,
+    increment_secs: u32,
+    color: Option<&str>,
+) -> Result<ChallengeCreated, Error> {
+    let color = color.unwrap_or("");
+    let pairs: Vec<(&str, String)> = vec![
+        ("rated", rated.to_string()),
+        ("clock.limit", clock_secs.to_string()),
+        ("clock.increment", increment_secs.to_string()),
+        ("color", color.to_string()),
+    ];
+    let form: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    let resp = ureq::post(&format!("{BASE}/api/challenge/{username}"))
+        .set("Authorization", &bearer(token))
+        .send_form(&form)?;
+    let accepted: ChallengeAccepted = resp.into_json()?;
+    Ok(accepted.challenge)
+}
+
+/// Stream the state of a Board API game. Calls `callback` for every event;
+/// the first one is always the full `GameFull` frame. The stream ends when
+/// the game ends.
+pub fn stream_board_game(
+    token: &str,
+    game_id: &str,
+    mut callback: impl FnMut(BoardStreamEvent),
+) -> Result<(), Error> {
+    let resp = ureq::get(&format!("{BASE}/api/board/game/{game_id}/stream"))
+        .set("Authorization", &bearer(token))
+        .set("Accept", "application/x-ndjson")
+        .call()?;
+    let reader = BufReader::new(resp.into_reader());
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<BoardStreamEvent>(&line) {
+            Ok(event) => callback(event),
+            Err(e) => log::warn!("Failed to parse board stream event: {}", e),
+        }
+    }
+    Ok(())
+}
+
+/// Make a move in a Board API game, UCI notation ("e2e4" or "e7e8q").
+/// Requires the `board:play` scope.
+pub fn play_board_move(token: &str, game_id: &str, uci: &str) -> Result<(), Error> {
+    let _ = ureq::post(&format!("{BASE}/api/board/game/{game_id}/move/{uci}"))
+        .set("Authorization", &bearer(token))
+        .call()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +236,16 @@ mod tests {
             snap.last_fen.is_some() || has_moves,
             "expected a lastFen or a non-empty moves list"
         );
+    }
+
+    // Requires network + a valid token. Run with:
+    //   LICHESS_API_TOKEN=... cargo test -p lichess -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn board_api_token_works() {
+        let token = read_token().expect("LICHESS_API_TOKEN set or a token file");
+        let me = account_me(&token).expect("account me with the token");
+        assert!(!me.username.is_empty());
+        println!("Token validates: account {} (id {})", me.username, me.id);
     }
 }

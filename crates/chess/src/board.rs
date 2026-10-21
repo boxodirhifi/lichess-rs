@@ -225,6 +225,47 @@ impl Board {
         })
     }
 
+    /// Parse a UCI move ("e2e4", "e7e8q"; castling may also be expressed as
+    /// king-to-rook, "e1h1"/"e1a1") among `side`'s legal moves — the
+    /// from-square must hold a piece of `side`. This is the format Lichess's
+    /// Board API streams moves in.
+    pub fn move_from_uci(&self, uci: &str, side: Color) -> Option<Move> {
+        let uci = uci.trim().to_ascii_lowercase();
+        let bytes = uci.as_bytes();
+        if bytes.len() != 4 && bytes.len() != 5 {
+            return None;
+        }
+        let from = Self::parse_square(&uci[..2])?;
+        let to = Self::parse_square(&uci[2..4])?;
+        if self.piece_at(from).map(|p| p.color) != Some(side) {
+            return None;
+        }
+        let promotion = match bytes.get(4) {
+            Some(&b) => Some(Self::char_to_kind(b as char)?),
+            None => None,
+        };
+
+        let legal = self.legal_moves_from(from);
+        legal
+            .iter()
+            .find(|m| m.to == to && m.promotion == promotion)
+            .copied()
+            .or_else(|| {
+                // King-to-rook castling notation: remap the target to the
+                // king's usual two-square destination.
+                let castle_file = match (from.file(), to.file()) {
+                    (4, 7) => Some(6), // e1h1 / e8h8 -> kingside
+                    (4, 0) => Some(2), // e1a1 / e8a8 -> queenside
+                    _ => None,
+                }?;
+                let castle_to = Square::from_file_rank(castle_file, from.rank())?;
+                legal
+                    .iter()
+                    .find(|m| m.to == castle_to && m.promotion.is_none())
+                    .copied()
+            })
+    }
+
     /// Apply a whitespace-separated SAN move list, alternating turns.
     pub fn apply_san_moves(&self, sans: &str, start_side: Color) -> Board {
         let mut board = self.clone();
@@ -1155,6 +1196,44 @@ mod tests {
             !board.legal_moves_from(from).iter().any(|m| m.to == g8),
             "no kingside castle without our own rook on the corner"
         );
+    }
+
+    #[test]
+    fn uci_moves_parse_against_legality() {
+        let start = Board::starting_position();
+        let e4 = start.move_from_uci("e2e4", Color::White).unwrap();
+        assert_eq!(e4.from.file(), 4);
+        assert_eq!(e4.to, Square::from_file_rank(4, 3).unwrap()); // e4
+        // Not a pawn's move; not legal; malformed inputs.
+        assert!(start.move_from_uci("e4e2", Color::White).is_none());
+        assert!(start.move_from_uci("e2e4", Color::Black).is_none());
+        assert!(start.move_from_uci("e2e9", Color::White).is_none());
+        assert!(start.move_from_uci("e2e4!", Color::White).is_none());
+    }
+
+    #[test]
+    fn uci_castling_accepts_king_to_rook() {
+        let board = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        // King-to-two-squares and king-to-rook both map onto the castling move.
+        let kingside = board.move_from_uci("e1g1", Color::White).unwrap();
+        assert_eq!(kingside.to, Square::from_file_rank(6, 0).unwrap());
+        assert_eq!(
+            kingside.to,
+            board.move_from_uci("e1h1", Color::White).unwrap().to
+        );
+        let queenside = board.move_from_uci("e1a1", Color::White).unwrap();
+        assert_eq!(queenside.to, Square::from_file_rank(2, 0).unwrap());
+    }
+
+    #[test]
+    fn uci_promotion_letters_map_to_kinds() {
+        let board = Board::from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1").unwrap();
+        let q = board.move_from_uci("e7e8q", Color::White).unwrap();
+        assert_eq!(q.promotion, Some(PieceKind::Queen));
+        let n = board.move_from_uci("e7e8n", Color::White).unwrap();
+        assert_eq!(n.promotion, Some(PieceKind::Knight));
+        // A promotion letter with no corresponding legal move.
+        assert!(board.move_from_uci("e7e8x", Color::White).is_none());
     }
 
     #[test]
