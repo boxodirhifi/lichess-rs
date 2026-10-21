@@ -72,9 +72,9 @@ impl UI {
 
     pub fn layout(&mut self, screen_w: f32, screen_h: f32) {
         self.squares.clear();
-        // 72% (not 80%) leaves a gutter under the board for the file labels,
-        // plus room for player info and the promotion menu around it.
-        let board_px = screen_w.min(screen_h) * 0.72;
+        // 80% of the smaller dimension. Coordinates live inside the edge
+        // squares (Lichess-style), so no outer gutter is needed.
+        let board_px = screen_w.min(screen_h) * 0.80;
         let sq_size = board_px / 8.0;
         let offset_x = (screen_w - board_px) / 2.0;
         let offset_y = (screen_h - board_px) / 2.0;
@@ -127,11 +127,10 @@ impl UI {
         // Vertical room outside the board. It is always at least one square
         // tall, and the menu must stay clear of it: board pieces are drawn on
         // top of quads, so an overlapping backdrop would look broken.
-        // Below the board we also skip the gutter reserved for file labels.
         let margin = if above {
             self.offset_y
         } else {
-            self.screen_h - (self.offset_y + self.board_px) - self.coordinate_gutter()
+            self.screen_h - (self.offset_y + self.board_px)
         };
         let side = (margin - pad * 2.0).clamp(sq * 0.4, sq);
         let total = PROMOTION_KINDS.len() as f32 * side;
@@ -142,8 +141,7 @@ impl UI {
         let y = if above {
             (self.offset_y - pad - side).max(pad)
         } else {
-            let top = self.offset_y + self.board_px + self.coordinate_gutter() + pad;
-            top.min((self.screen_h - pad - side).max(pad))
+            (self.offset_y + self.board_px + pad).min((self.screen_h - pad - side).max(pad))
         };
 
         PROMOTION_KINDS
@@ -300,12 +298,6 @@ impl UI {
     pub fn square_size(&self) -> f32 {
         self.sq_size
     }
-
-    /// Height of the strip below the board reserved for the file labels.
-    /// Rendering code should keep text and menus clear of this band.
-    pub fn coordinate_gutter(&self) -> f32 {
-        self.sq_size * 0.55
-    }
 }
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
@@ -455,29 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn board_leaves_room_for_coordinates() {
+    fn board_is_eighty_percent_of_the_window() {
         let ui = ui_at(1000.0, 1000.0);
-        assert!((ui.square_size() * 8.0 - 720.0).abs() < 0.001, "board should be 72% of the window");
-        assert!(ui.coordinate_gutter() > 0.0);
-        // The gutter must fit inside the margin below the board.
-        let (_, oy) = ui.board_offset();
-        let margin = 1000.0 - (oy + ui.square_size() * 8.0);
-        assert!(ui.coordinate_gutter() < margin);
-    }
-
-    #[test]
-    fn promotion_menu_clears_the_coordinate_gutter() {
-        let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(4, 0).unwrap(); // e1
-        ui.open_promotion(Square::from_file_rank(4, 1).unwrap(), to, chess::Color::Black);
-
-        let (_, oy) = ui.board_offset();
-        let board_bottom = oy + ui.square_size() * 8.0;
-        for c in ui.promotion_choices() {
-            assert!(
-                c.rect.y >= board_bottom + ui.coordinate_gutter() - 0.001,
-                "promotion menu overlaps the file-label gutter"
-            );
-        }
+        assert!(
+            (ui.square_size() * 8.0 - 800.0).abs() < 0.001,
+            "board should fill 80% of the smaller window dimension"
+        );
     }
 }

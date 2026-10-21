@@ -134,6 +134,7 @@ impl Renderer {
                 size,
                 color: [1.0, 1.0, 1.0, 1.0],
                 align: TextAlign::Center,
+                shadow: true,
             });
         }
 

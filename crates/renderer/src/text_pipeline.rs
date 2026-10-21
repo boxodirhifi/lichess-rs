@@ -31,6 +31,9 @@ pub struct TextElement {
     pub size: f32,
     pub color: [f32; 4],
     pub align: TextAlign,
+    /// Dark offset pass behind the glyphs. Only for text that overlays the
+    /// board (game-over banner); keep off for crisp flat UI text.
+    pub shadow: bool,
 }
 
 struct GlyphInfo {
@@ -84,12 +87,16 @@ fn piece_char(kind: chess::PieceKind) -> char {
     }
 }
 
-fn piece_colors(color: chess::Color) -> ([f32; 4], [f32; 4]) {
-    let shadow = [0.0, 0.0, 0.0, 0.35];
+fn piece_tint(color: chess::Color) -> [f32; 4] {
     match color {
-        chess::Color::White => ([0.98, 0.98, 0.98, 1.0], shadow),
-        chess::Color::Black => ([0.10, 0.10, 0.10, 1.0], shadow),
+        chess::Color::White => [0.98, 0.98, 0.98, 1.0],
+        chess::Color::Black => [0.10, 0.10, 0.10, 1.0],
     }
+}
+
+fn piece_outline(_color: chess::Color) -> [f32; 4] {
+    // Both colors get the same dark outline for consistency.
+    [0.20, 0.18, 0.16, 1.0]
 }
 
 impl TextPipeline {
@@ -405,8 +412,10 @@ impl TextPipeline {
                 TextAlign::Center => t.x - total_w / 2.0,
                 TextAlign::Right => t.x - total_w,
             };
-            let off = t.size * 0.04;
-            self.push_text(&t.text, x + off, t.y + off, scale, [0.0, 0.0, 0.0, 0.85]);
+            if t.shadow {
+                let off = t.size * 0.04;
+                self.push_text(&t.text, x + off, t.y + off, scale, [0.0, 0.0, 0.0, 0.85]);
+            }
             self.push_text(&t.text, x, t.y, scale, t.color);
         }
 
@@ -429,11 +438,21 @@ impl TextPipeline {
         let h = gh * scale;
         let x0 = cx - w * 0.5;
         let y0 = cy - h * 0.5;
-        let (tint, shadow) = piece_colors(color);
-        let sdx = size * 0.02;
-        let sdy = size * 0.03;
-        self.push_quad(x0 + sdx, y0 + sdy, w, h, uv, shadow);
-        self.push_quad(x0, y0, w, h, uv, tint);
+
+        // Solid border: stamp the glyph in the outline colour in a ring
+        // around the piece, then the tinted fill on top. This is what keeps
+        // white pieces readable on light squares (and black on dark), the
+        // same trick the Lichess/Chess.com piece sets use.
+        let t = (size * 0.03).clamp(1.0, 2.5);
+        let outline = piece_outline(color);
+        const RING: [(f32, f32); 8] = [
+            (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+            (0.7071, 0.7071), (0.7071, -0.7071), (-0.7071, 0.7071), (-0.7071, -0.7071),
+        ];
+        for (dx, dy) in RING {
+            self.push_quad(x0 + dx * t, y0 + dy * t, w, h, uv, outline);
+        }
+        self.push_quad(x0, y0, w, h, uv, piece_tint(color));
     }
 
     fn push_text(&mut self, text: &str, x: f32, baseline_y: f32, scale: f32, color: [f32; 4]) {
