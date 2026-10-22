@@ -5,7 +5,11 @@ use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
-use shakmaty::variant::VariantPosition;
+use shakmaty::FromSetup;
+use shakmaty::variant::{
+    Antichess, Atomic, Crazyhouse, Horde, KingOfTheHill, RacingKings, ThreeCheck, Variant,
+    VariantPosition,
+};
 use shakmaty::{
     CastlingMode, Chess, Color, KnownOutcome, Move, Outcome, Position, Role, Square,
 };
@@ -15,6 +19,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     FeaturedGame {
+        /// Lichess TV channel key (e.g. "atomic"); names the game's variant.
+        channel: String,
         fen: String,
         white_name: String,
         white_rating: u32,
@@ -24,6 +30,7 @@ pub enum NetEvent {
         black_secs: u32,
     },
     FenUpdate {
+        channel: String,
         fen: String,
         white_secs: u32,
         black_secs: u32,
@@ -121,17 +128,46 @@ struct App {
     online_error: Option<String>,
 }
 
-/// Parse a standard FEN into the app's variant-position type. The actual
-/// variant selection for TV arrives in Stage 3; today every game is standard.
-fn position_from_fen(fen: &str) -> Option<VariantPosition> {
-    Fen::from_ascii(fen.as_bytes())
-        .ok()
-        .and_then(|fen| fen.into_position::<Chess>(CastlingMode::Standard).ok())
-        .map(VariantPosition::from)
+/// Map a Lichess TV channel key to its shakmaty variant. `Variant::from_ascii`
+/// already accepts the Lichess spellings (`kingOfTheHill`, `threeCheck`,
+/// `chess960`, …); unknown keys degrade to standard chess.
+fn channel_variant(channel: &str) -> Variant {
+    Variant::from_ascii(channel.as_bytes()).unwrap_or(Variant::Chess)
+}
+
+/// Castling rights in Lichess variant FENs use standard notation; only the
+/// Chess960 channel allows rooks anywhere on the backrank.
+fn channel_castling_mode(channel: &str) -> CastlingMode {
+    match channel_variant(channel) {
+        Variant::Chess if channel == "chess960" => CastlingMode::Chess960,
+        _ => CastlingMode::Standard,
+    }
+}
+
+/// Parse a TV FEN into the variant position its channel plays: a concrete
+/// `FromSetup` constructor per variant, wrapped in `VariantPosition` for
+/// rendering. Variant-only moves (Crazyhouse drops etc.) stay spectate-only.
+fn position_from_fen(channel: &str, fen: &str) -> Option<VariantPosition> {
+    let setup = Fen::from_ascii(fen.as_bytes()).ok()?.into_setup();
+    let mode = channel_castling_mode(channel);
+    let pos: VariantPosition = match channel_variant(channel) {
+        Variant::Atomic => Atomic::from_setup(setup, mode).ok()?.into(),
+        Variant::Antichess => Antichess::from_setup(setup, mode).ok()?.into(),
+        Variant::KingOfTheHill => KingOfTheHill::from_setup(setup, mode).ok()?.into(),
+        Variant::ThreeCheck => ThreeCheck::from_setup(setup, mode).ok()?.into(),
+        Variant::Crazyhouse => Crazyhouse::from_setup(setup, mode).ok()?.into(),
+        Variant::RacingKings => RacingKings::from_setup(setup, mode).ok()?.into(),
+        Variant::Horde => Horde::from_setup(setup, mode).ok()?.into(),
+        Variant::Chess => Chess::from_setup(setup, mode).ok()?.into(),
+    };
+    Some(pos)
 }
 
 /// `Move::to()` reports the rook square for castling; clicks and highlights
-/// work on the king's destination square.
+/// work on the king's destination square. Variant-only move kinds
+/// (Crazyhouse drops, etc.) have no origin square, so the
+/// `mv.from() == Some(..)` filters at the click sites already exclude them —
+/// variant play stays spectate-only.
 fn move_destination(mv: Move, pos: &VariantPosition) -> Square {
     match mv {
         Move::Castle { .. } => mv
@@ -147,6 +183,28 @@ fn color_name(color: Color) -> &'static str {
         Color::White => "White",
         Color::Black => "Black",
     }
+}
+
+/// Human text for a variant-specific ending: the variant names how the game
+/// ended; the position's outcome names who won.
+fn variant_end_text(board: &VariantPosition) -> String {
+    let result = match board.outcome() {
+        Outcome::Known(KnownOutcome::Decisive { winner }) => {
+            format!("{} wins", color_name(winner))
+        }
+        Outcome::Known(KnownOutcome::Draw) => "draw".to_string(),
+        Outcome::Unknown => "game over".to_string(),
+    };
+    let how = match board.variant() {
+        Variant::Atomic => "King exploded",
+        Variant::Antichess => "All pieces given away",
+        Variant::KingOfTheHill => "King in the centre",
+        Variant::ThreeCheck => "Third check delivered",
+        Variant::RacingKings => "Race finished",
+        Variant::Horde => "Horde defeated",
+        Variant::Chess | Variant::Crazyhouse => "Variant game",
+    };
+    format!("{} - {}", how, result)
 }
 
 fn format_clock(secs: f64) -> String {
@@ -211,24 +269,31 @@ impl App {
         self.board.outcome().is_known() || self.board.halfmoves() >= 100
     }
 
-    /// Game-over text derived from shakmaty's outcome and terminal-state
-    /// predicates. No local game-status enum: the position is the truth.
-    fn local_banner(&self) -> Option<String> {
-        match self.board.outcome() {
+    /// End-of-game banner text, shared by local play and TV spectating.
+    /// Derived from shakmaty's outcome and terminal-state predicates — no
+    /// local game-status enum: the position is the truth. Variant endings
+    /// come first (exploded king, king in the centre, check count, lost
+    /// horde …); then the standard checkmate/stalemate/draw branches; the
+    /// 50-move rule last.
+    fn game_banner(board: &VariantPosition) -> Option<String> {
+        if board.is_variant_end() {
+            return Some(variant_end_text(board));
+        }
+        match board.outcome() {
             Outcome::Known(KnownOutcome::Decisive { winner }) => {
                 Some(format!("Checkmate - {} wins", color_name(winner)))
             }
             Outcome::Known(KnownOutcome::Draw) => {
-                if self.board.is_stalemate() {
+                if board.is_stalemate() {
                     Some("Stalemate - Draw".to_string())
-                } else if self.board.is_insufficient_material() {
+                } else if board.is_insufficient_material() {
                     Some("Draw - insufficient material".to_string())
                 } else {
                     Some("Draw".to_string())
                 }
             }
             Outcome::Unknown => {
-                if self.board.halfmoves() >= 100 {
+                if board.halfmoves() >= 100 {
                     Some("Draw - 50-move rule".to_string())
                 } else {
                     None
@@ -662,8 +727,14 @@ impl ApplicationHandler<NetEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
         match event {
-            NetEvent::FeaturedGame { fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs } => {
-                let board = position_from_fen(&fen);
+            NetEvent::FeaturedGame { channel, fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs } => {
+                let board = match position_from_fen(&channel, &fen) {
+                    Some(board) => Some(board),
+                    None => {
+                        log::warn!("Dropping unparseable TV fen: {}", fen);
+                        None
+                    }
+                };
                 let side = board.as_ref().map(|board| board.turn()).unwrap_or(Color::White);
                 if let Some(board) = board {
                     self.live_board = Some(board);
@@ -680,19 +751,27 @@ impl ApplicationHandler<NetEvent> for App {
                     game_over: false,
                 });
             }
-            NetEvent::FenUpdate { fen, white_secs, black_secs } => {
-                if let Some(board) = position_from_fen(&fen) {
-                    let side = board.turn();
-                    let terminal = board.outcome().is_known() || board.halfmoves() >= 100;
-                    self.live_board = Some(board);
-                    if let Some(info) = &mut self.live_info {
-                        info.white_clock = white_secs as f64;
-                        info.black_clock = black_secs as f64;
-                        info.side_to_move = side;
-                        info.last_update = Instant::now();
-                        if terminal || white_secs == 0 || black_secs == 0 {
-                            info.game_over = true;
-                        }
+            NetEvent::FenUpdate { channel, fen, white_secs, black_secs } => {
+                let board = match position_from_fen(&channel, &fen) {
+                    Some(board) => board,
+                    None => {
+                        log::warn!("Dropping unparseable TV fen: {}", fen);
+                        return;
+                    }
+                };
+                let side = board.turn();
+                // Variant games can end without a standard checkmate/stalemate
+                // (exploded king, king in the centre, lost horde, check count).
+                let terminal =
+                    board.outcome().is_known() || board.is_variant_end() || board.halfmoves() >= 100;
+                self.live_board = Some(board);
+                if let Some(info) = &mut self.live_info {
+                    info.white_clock = white_secs as f64;
+                    info.black_clock = black_secs as f64;
+                    info.side_to_move = side;
+                    info.last_update = Instant::now();
+                    if terminal || white_secs == 0 || black_secs == 0 {
+                        info.game_over = true;
                     }
                 }
             }
@@ -721,7 +800,7 @@ impl ApplicationHandler<NetEvent> for App {
                 };
                 let mut board = match initial_fen.as_deref().unwrap_or("startpos") {
                     "startpos" => VariantPosition::default(),
-                    fen => position_from_fen(fen).unwrap_or_default(),
+                    fen => position_from_fen("standard", fen).unwrap_or_default(),
                 };
                 replay_uci(&mut board, &moves);
                 self.online = Online::Active(Box::new(OnlineGame {
@@ -864,8 +943,17 @@ impl ApplicationHandler<NetEvent> for App {
                     }
                 }).collect();
                 let banner: Option<String> = match self.mode {
-                    Mode::Local => self.local_banner(),
-                    Mode::Live => None,
+                    Mode::Local => App::game_banner(&self.board),
+                    Mode::Live => {
+                        // TV games end either through the standard outcomes,
+                        // the window's 50-move counter, or a variant ending;
+                        // show the banner text once the worker freezes them.
+                        if self.live_info.as_ref().is_some_and(|info| info.game_over) {
+                            self.live_board.as_ref().and_then(App::game_banner)
+                        } else {
+                            None
+                        }
+                    }
                     Mode::Play => {
                         if let Some(error) = &self.online_error {
                             Some(error.clone())
@@ -923,10 +1011,32 @@ impl ApplicationHandler<NetEvent> for App {
     }
 }
 
+/// TV channels the worker rotates through. The variant channels make sure
+/// every shakmaty variant lights up during a cycle; each stream is held
+/// open for `TV_CHANNEL_DWELL` and then rotated.
+const TV_CHANNELS: &[&str] = &[
+    "best",
+    "atomic",
+    "horde",
+    "crazyhouse",
+    "kingOfTheHill",
+    "threeCheck",
+    "antichess",
+    "racingKings",
+    "chess960",
+];
+
+/// How long one TV channel is watched before rotating to the next.
+const TV_CHANNEL_DWELL: Duration = Duration::from_secs(30);
+
 fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
+    let mut channel_idx = 0usize;
     loop {
-        log::info!("Connecting to Lichess TV stream...");
-        let result = lichess::stream_tv_feed(|event| {
+        let channel = TV_CHANNELS[channel_idx % TV_CHANNELS.len()];
+        channel_idx += 1;
+        let started = Instant::now();
+        log::info!("Connecting to Lichess TV stream (channel {})...", channel);
+        let result = lichess::stream_tv_feed(Some(channel), TV_CHANNEL_DWELL, |event| {
             match event {
                 lichess::TvStreamEvent::Featured(data) => {
                     let mut white_name = String::new();
@@ -945,6 +1055,7 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
                         }
                     }
                     let _ = proxy.send_event(NetEvent::FeaturedGame {
+                        channel: channel.to_string(),
                         fen: data.fen,
                         white_name, white_rating,
                         black_name, black_rating,
@@ -953,6 +1064,7 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
                 }
                 lichess::TvStreamEvent::Fen(data) => {
                     let _ = proxy.send_event(NetEvent::FenUpdate {
+                        channel: channel.to_string(),
                         fen: data.fen,
                         white_secs: data.wc,
                         black_secs: data.bc,
@@ -961,9 +1073,14 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
             }
         });
 
-        if let Err(e) = result {
-            log::warn!("Stream ended: {}, reconnecting in 1s", e);
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        match result {
+            Ok(()) => log::info!("TV stream (channel {}) rotated", channel),
+            Err(e) => log::warn!("TV stream (channel {}) ended: {}", channel, e),
+        }
+
+        // Don't hot-loop when a channel is refused or closes at once.
+        if started.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }
@@ -1124,7 +1241,7 @@ mod tests {
     use super::*;
 
     fn app_from_fen(fen: &str) -> App {
-        let board = position_from_fen(fen).expect("valid test FEN");
+        let board = position_from_fen("standard", fen).expect("valid test FEN");
         let side = board.turn();
         let mut app = App {
             proxy: None,
@@ -1149,6 +1266,94 @@ mod tests {
     /// A board with a white pawn on the 7th rank, ready to promote.
     fn app_with_promoting_pawn() -> App {
         app_from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1")
+    }
+
+    /// Piece counts per colour on a variant board (sane-count assertions).
+    fn piece_counts(board: &VariantPosition) -> (u32, u32) {
+        Square::ALL
+            .into_iter()
+            .filter_map(|sq| board.board().piece_at(sq))
+            .fold((0, 0), |(white, black), piece| match piece.color {
+                Color::White => (white + 1, black),
+                Color::Black => (white, black + 1),
+            })
+    }
+
+    #[test]
+    fn tv_channel_keys_pick_their_variants() {
+        assert_eq!(channel_variant("atomic"), Variant::Atomic);
+        assert_eq!(channel_variant("horde"), Variant::Horde);
+        assert_eq!(channel_variant("crazyhouse"), Variant::Crazyhouse);
+        assert_eq!(channel_variant("antichess"), Variant::Antichess);
+        assert_eq!(channel_variant("kingOfTheHill"), Variant::KingOfTheHill);
+        assert_eq!(channel_variant("threeCheck"), Variant::ThreeCheck);
+        assert_eq!(channel_variant("racingKings"), Variant::RacingKings);
+        // Chess960 is standard chess with different castling encoding.
+        assert_eq!(channel_variant("chess960"), Variant::Chess);
+        assert_eq!(channel_castling_mode("chess960"), CastlingMode::Chess960);
+        assert_eq!(channel_castling_mode("atomic"), CastlingMode::Standard);
+        // Unknown keys degrade to standard chess instead of failing.
+        assert_eq!(channel_variant("mystery"), Variant::Chess);
+    }
+
+    #[test]
+    fn tv_games_build_their_variants() {
+        // A real Lichess TV horde game: a pawn horde vs a small army.
+        let horde = position_from_fen(
+            "horde",
+            "4k1nr/r7/5PP1/4P3/1P1P1PP1/1PP3PP/PPP4P/1PPP1Pq1 b k - 0 33",
+        )
+        .expect("horde fen");
+        assert_eq!(horde.variant(), Variant::Horde);
+        let (white, black) = piece_counts(&horde);
+        assert_eq!(white, 19, "the horde is pawns only");
+        assert_eq!(black, 5);
+        let _ = horde.legal_moves();
+
+        // A real Lichess TV atomic game.
+        let atomic = position_from_fen(
+            "atomic",
+            "r2k1b1r/pp3Bp1/2p2p2/4p2p/3PP3/2P2P2/PP4P1/R4K2 b - - 0 15",
+        )
+        .expect("atomic fen");
+        assert_eq!(atomic.variant(), Variant::Atomic);
+        let (white, black) = piece_counts(&atomic);
+        assert_eq!(white, 10);
+        assert_eq!(black, 11);
+        let _ = atomic.legal_moves();
+
+        // Crazyhouse positions carry pockets, which nothing but rules use
+        // (UI and rendering read the board only) — spectate-only.
+        let crazy = position_from_fen(
+            "crazyhouse",
+            "1Q~2bq2/4b1kp/3pPp1n/6p1/4b2P/4P1R1/PPP2PP1/R2QK1NR/NNBRppp w KQ - 0 32",
+        )
+        .expect("crazyhouse fen");
+        assert_eq!(crazy.variant(), Variant::Crazyhouse);
+        assert!(crazy.pockets().is_some());
+        let _ = crazy.legal_moves();
+    }
+
+    #[test]
+    fn atomic_positions_stay_out_of_standard_chess() {
+        // Kings on a8/b7 are adjacent: legal in Atomic (capturing the king
+        // ends the game with an explosion), illegal as standard chess.
+        let adjacent = "k7/1K6/8/8/8/8/8/8 w - - 0 1";
+        assert!(position_from_fen("atomic", adjacent).is_some());
+        assert!(position_from_fen("standard", adjacent).is_none());
+    }
+
+    #[test]
+    fn variant_end_banner_names_the_variant() {
+        // White king already stands on one of the four centre (hill) squares.
+        let board = position_from_fen("kingOfTheHill", "8/8/8/3K4/8/8/8/k7 w - - 0 1")
+            .expect("king of the hill fen");
+        assert!(board.is_variant_end());
+        let text = App::game_banner(&board).expect("variant banner");
+        assert!(
+            text.starts_with("King in the centre - White wins"),
+            "banner: {text}"
+        );
     }
 
     /// Center of a square in window coordinates.

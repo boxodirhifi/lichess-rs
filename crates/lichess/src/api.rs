@@ -53,16 +53,37 @@ pub fn fetch_game_snapshot(game_id: &str) -> Result<GameSnapshot, Error> {
     Ok(snap)
 }
 
-/// Open a long-lived NDJSON stream to the Lichess TV feed.
-/// Calls `callback` for each event. Returns `Err` when the stream ends.
-pub fn stream_tv_feed(mut callback: impl FnMut(TvStreamEvent)) -> Result<(), Error> {
-    let resp = ureq::get(&format!("{}/api/tv/feed", BASE))
-        .set("Accept", "application/x-ndjson")
-        .call()?;
+/// Stream Lichess TV. A `channel` key (e.g. "atomic", "horde") selects the
+/// per-channel feed `/api/tv/{channel}/feed`; `None` falls back to the
+/// all-channels feed. `dwell` bounds how long the stream is held open: the
+/// socket read errors out once the deadline passes and that is reported as
+/// `Ok(())` so a single blocking thread can rotate channels without an
+/// async runtime. Calls `callback` for each event.
+pub fn stream_tv_feed(
+    channel: Option<&str>,
+    dwell: std::time::Duration,
+    mut callback: impl FnMut(TvStreamEvent),
+) -> Result<(), Error> {
+    let url = match channel {
+        Some(ch) => format!("{}/api/tv/{}/feed", BASE, ch),
+        None => format!("{}/api/tv/feed", BASE),
+    };
+    let agent = ureq::AgentBuilder::new().timeout(dwell).build();
+    let resp = agent.get(&url).set("Accept", "application/x-ndjson").call()?;
 
     let reader = BufReader::new(resp.into_reader());
     for line in reader.lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // The dwell deadline passed: normal rotation, not a failure.
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if line.is_empty() {
             continue;
         }

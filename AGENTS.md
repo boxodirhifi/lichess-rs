@@ -102,19 +102,30 @@ promotion menu.
 ## Roadmap
 
 Completed:
+- [x] **Shakmaty migration** (Stages 0–3 done; spec below)
 - [x] Real-time NDJSON streaming (replaced polling)
 - [x] Clocks + player names/ratings (+ freeze on game over)
 - [x] Pawn promotion menu (interactive, tested)
 - [x] Event-driven rendering (CPU fix)
 - [x] Board coordinates (in-square, Lichess-style)
 - [x] Flat rendering + solid piece outlines
+- [x] Spectating all Lichess TV variants (`Stage 3`: channel → shakmaty variant)
 
-In progress:
-- [ ] **Shakmaty migration** (Stages 0–2 done; Stage 3 below)
+Known limitations:
+- **No threefold-repetition tracking.** shakmaty positions are stateless (no move
+  history), so a threefold draw can only be detected with a history tracker (e.g.
+  a repetition hash per position). The 50-move banner *is* tracked via
+  `halfmoves() >= 100`.
 
 Next:
 - [ ] SVG piece sets via `resvg` (cburnett set, GPL-compatible) — own increment
-- [ ] Playable games (Lichess Board API + token auth; shakmaty gives UCI for free)
+- [ ] Finish playable online games. Scaffolding already in the client:
+  token auth (`~/.config/lichess-rs/token`, `Mode::Play`), challenge creation +
+  Board API game stream (`stream_board_game`), move posting (`play_board_move`),
+  UCI replay of the server move list via `replay_uci`. What remains is
+  challenge UX (opponent/clock/time-control setup), takebacks/claims, and the
+  swap from "echo the server" latency smoothing.
+- [ ] Variant *play* (Crazyhouse drops etc.) — spectate-only today.
 - [ ] Theming — and only then `notify` for hot-reload
 
 ## Migration Spec: shakmaty (execute in order, one commit per stage)
@@ -152,13 +163,34 @@ Next:
   (use `shakmaty::perft` if exposed, else a 5-line recursion over `legal_moves()`).
 - Gate: `cargo test` green; `cargo run` plays locally and streams live TV.
 
-### Stage 3 — variants light up
-- `lichess` worker: pass the channel/variant name through `NetEvent`; client builds
-  the matching variant position from the FEN; stop filtering to standard-only channels.
-- UI: ignore variant-specific move kinds (drops) for now — spectate only.
-- Tests: parse a horde FEN and an atomic FEN; `legal_moves()` doesn't panic; piece
-  counts sane.
-- Gate: `cargo test` green; `cargo run` cycles variant TV games without crashing.
+### Stage 3 — variants light up ✅
+- `lichess` worker: streams one TV channel at a time from the *per-channel* feed
+  `/api/tv/{channel}/feed` (`?channel=` on `/api/tv/feed` is ignored upstream) and
+  passes the channel key through `NetEvent::{FeaturedGame,FenUpdate}`. The worker
+  rotates through `TV_CHANNELS` (`best`, `atomic`, `horde`, `crazyhouse`,
+  `kingOfTheHill`, `threeCheck`, `antichess`, `racingKings`, `chess960`); each
+  stream is held open for `TV_CHANNEL_DWELL` (30 s) via an overall ureq timeout —
+  the deadline surfaces as a read error and is reported as `Ok(())` so one
+  blocking thread can rotate without an async runtime.
+- `client`: `position_from_fen(channel, fen)` resolves the channel key with
+  `Variant::from_ascii` and builds the concrete position via the per-variant
+  `FromSetup` constructors (`Atomic::from_setup`, `Horde::from_setup`, …),
+  wrapped in `VariantPosition`. Chess960 maps to `Variant::Chess` with
+  `CastlingMode::Chess960`. Only the "standard" channel (online-play initial
+  FENs) is intentionally parsed as plain `Chess`.
+- Banner: `App::game_banner(board)`, shared by local play and TV. Variant endings
+  first via `is_variant_end()` + `variant_end_text()` ("King in the centre",
+  "King exploded", …), then checkmate/stalemate/insufficient-material, then the
+  50-move rule.
+- Spectate-only: clicks do nothing in Live mode, and Crazyhouse `Move::Put`
+  (drops) has no origin square, so origin-square filters already exclude it —
+  no variant play.
+- Tests: horde + atomic + crazyhouse TV FENs parse into their variants with
+  exact piece counts, `legal_moves()` runs without panicking, and pockets are
+  visible; an adjacent-kings FEN parses as Atomic but fails as standard chess;
+  the channel→variant map and the KOTH variant-end banner text are covered.
+- Gate: `cargo test` green; `cargo run` cycles variant TV games without crashing
+  (verified end-to-end through all nine channels).
 
 ## Rules for Agents
 
