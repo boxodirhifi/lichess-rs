@@ -12,117 +12,159 @@ not a web page wrapped in a browser.
 ### Hard Constraints (do NOT violate)
 - **No heavyweight GUI frameworks.** No Qt, GTK, Electron, WebView, or similar.
   All rendering is done through our own lightweight UI layer on top of `wgpu`.
-- **Wayland-first on Linux.** The app must work correctly on Wayland compositors.
-- **Resource-efficient.** Avoid heavy async runtimes and unnecessary dependencies.
-  The app should use ~0% CPU when idle and stay lean.
-- **Modular architecture.** Each concern lives in its own crate. The chess core is
-  independent of UI and Lichess networking.
+- **Wayland-first on Linux.**
+- **Resource-efficient.** ~0% CPU when idle. No async runtime. Lean dependency tree.
+- **Modular architecture.** Lichess networking is decoupled from rendering; chess
+  rules are delegated entirely to `shakmaty` (see below).
 
 ## Architecture
 
-Workspace of six crates. Respect the dependency direction (arrows point to "depends on"):
-client ──▶ renderer ──▶ chess
-│ │
-├──▶ ui ───────┤
-├──▶ platform
-└──▶ lichess
+Workspace crates (post-migration):
 
 | Crate | Responsibility |
 |---|---|
-| `chess` | Pure chess logic: board model, FEN parsing, move generation, legality, SAN parsing. **No UI, no networking.** Fully unit-tested. |
-| `renderer` | `wgpu` rendering: quad pipeline (squares), text/glyph pipeline (text atlas + piece glyphs). Knows about `chess` types but not `ui`. |
-| `ui` | Layout & interaction logic: board squares, selection, move targets, promotion menu. Produces render-ready geometry. |
+| `client` | The binary. Event loop, app state, wires everything together. |
+| `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text + piece glyphs today). |
+| `ui` | Layout & interaction geometry: squares, selection, move targets, promotion menu, coordinates. |
 | `platform` | Window creation & Wayland/X11 integration via `winit`. |
-| `lichess` | Lichess API: REST (`ureq`) + real-time NDJSON streaming. Returns plain data; never touches rendering or the board. |
-| `client` | The binary. Owns the event loop, app state, and wires everything together. |
+| `lichess` | REST (`ureq`) + real-time NDJSON streaming. Returns plain data (FEN/SAN strings, player info). Never touches `shakmaty` or rendering. |
+| ~~`chess`~~ | **Deleted** during the shakmaty migration. Do not reintroduce. |
+
+Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
+`renderer`/`ui` → `shakmaty` (types only).
+
+## Chess Core: shakmaty, first-class
+
+- **All chess rules come from `shakmaty` 0.30 with `features = ["variant"]`.**
+  No wrappers, no translation layer, no local aliases: code uses shakmaty types
+  directly — `Square`, `Color`, `Role`, `Piece`, `Move`, `Chess`, `VariantPosition`,
+  the `Position` trait.
+- Piece types are **`shakmaty::Role`** (there is no `PieceKind`). Squares are
+  `shakmaty::Square` (`#[repr(u8)]`, `A1 = 0 … H8 = 63`); numeric index via
+  `sq as u8`; file/rank via `.file()` / `.rank()` or index math (`idx % 8`, `idx / 8`,
+  rank 0 = bottom of the board).
+- **Game end is matched on shakmaty's `Outcome` / `is_checkmate()` / `is_stalemate()`
+  directly at the use site.** There is no local `GameStatus` enum.
+- **Variants:** positions are held as `shakmaty::VariantPosition` so any Lichess
+  variant parses and renders. For TV, the variant is determined by the channel key
+  (the stream worker must pass it through `NetEvent`). Spectating all variants is in
+  scope; variant *play* (e.g. Crazyhouse drops in the UI) is deferred.
+- **Never hand-roll** move generation, legality, SAN/FEN parsing, or check detection.
+  Use `shakmaty::{san::San, uci::Uci, fen::Fen, Position}`.
+
+## Error Handling
+
+- Library crates (`lichess`, future libs): **`thiserror`** for typed errors; wrap
+  upstream errors (`ureq`, `serde_json`, `shakmaty`) with `#[from]`.
+- The `client` binary: **`anyhow`** at top level where typed matching isn't needed.
+- No hand-written `Display`/`Error` impls for new error types.
 
 ## Key Design Decisions (the "why")
 
-### 1. No tokio — blocking thread + EventLoopProxy
-We deliberately do **not** use `tokio` or a heavy async runtime. We have exactly
-one background task (the Lichess stream), so a single `std::thread` running blocking
-`ureq` is simpler, leaner, and just as correct. The thread pushes updates to the
-winit event loop via `EventLoopProxy` (thread-safe). **Do not introduce an async
-runtime unless we genuinely need many concurrent connections.**
-
-### 2. NDJSON streaming, not WebSocket
-Lichess's public real-time API is NDJSON streaming. The WebSocket is internal and
-undocumented. We stream `GET /api/tv/feed` line-by-line on the background thread.
-Stick with NDJSON unless a feature specifically requires the WebSocket.
-
-### 3. Event-driven rendering (not a render loop)
-The app only redraws when state **actually changes** (a move arrives, the user
-interacts, the window resizes) — including the one visible change that happens
-on a timer: while spectating a live game whose clocks are still running,
-`App::next_clock_tick()` schedules a redraw roughly every second via
-`ControlFlow::WaitUntil` so the clocks visibly tick between server updates.
-That is still event-driven (one scheduled redraw per state change), not a
-render loop. Request redraws only in response to real changes. When idle,
-CPU usage should be ~0%.
-
-### 4. Clocks trust the server (no client interpolation)
-For spectating, we display the exact clock values the server sends rather than
-interpolating between events. Interpolation causes visible jitter/snaps in fast
-formats (e.g. 1+0 bullet) because network latency makes our estimate drift from
-the server's truth. Keep clocks server-authoritative.
-
-### 5. Clocks freeze on game over
-`LiveGameInfo.game_over` is set when the position is terminal or a flag drops.
-When true, elapsed time is not subtracted from clocks so they don't drain forever.
-
-### 6. Custom text rendering via glyph atlas
-We rasterize glyphs (ASCII + chess piece Unicode) into a single GPU texture atlas
-using `ab_glyph` and draw them as textured quads. This powers both text and pieces.
-Don't reach for an external text/GUI library — extend the existing pipeline.
-
-### 7. Board coordinates are drawn inside edge squares (no outer gutter)
-The board is 80% of the smaller window dimension. File letters (a–h) and rank
-numbers (1–8) are drawn *inside* the corner squares of the h-file and first
-rank (Lichess-style), tinted with the opposite colour of the square they sit
-on (see `coord_color` in `client`) so they always contrast. Because no outer
-gutter is reserved, the promotion menu may freely dock in the margin outside
-the board. If the board ratio changes, keep `UI::layout()` and the
-coordinate-gutter assumption in sync.
+1. **No tokio.** One `std::thread` + blocking `ureq` for the stream; results pushed
+   into winit via `EventLoopProxy`. Do not add an async runtime unless we genuinely
+   need many concurrent connections.
+2. **NDJSON streaming, not WebSocket.** `GET /api/tv/feed` line-by-line. Lichess's
+   WebSocket is internal/undocumented.
+3. **Event-driven rendering.** `request_redraw()` only when visual state actually
+   changes (network event, input, resize, first frame). Never unconditionally at the
+   end of `window_event` — that caused a 100%-CPU unbounded loop before.
+4. **Clocks trust the server.** Display exact `wc`/`bc` values; freeze via
+   `LiveGameInfo.game_over` when the game ends. No client-side interpolation.
+5. **Pieces are Unicode glyphs** rasterized via `ab_glyph` into a GPU atlas, drawn
+   with a solid 8-offset outline (Lichess/Chess.com-style contrast). Planned upgrade:
+   real SVG piece sets via `resvg` (separate increment — see Roadmap). Keep the glyph
+   path until then.
+6. **Coordinates are in-square, Lichess-style:** files `a–h` bottom-left of rank-1
+   squares, ranks `1–8` top-right of h-file squares, tinted with the opposite color
+   of their square. Board = 80% of the min window dimension. No outer gutter.
+7. **Text is flat.** No drop shadows, except the game-over banner which overlays the
+   board (`TextElement.shadow = true` only there).
 
 ## Coding Conventions
 
-- **Complete files over patches.** When modifying, provide the full file so changes
-  are unambiguous and easy to apply.
-- **Keep crates decoupled.** Don't add cross-crate dependencies that violate the
-  diagram above.
-- **Test the chess core.** Any new chess logic needs unit tests in `crates/chess`.
-- **No `unwrap()` in hot paths.** Prefer graceful degradation; `unwrap` is acceptable
-  only where failure truly means the app cannot continue.
-- Match existing style: 4-space indent, `snake_case`, concise but clear names.
+- **Complete files over patches** when modifying.
+- Keep crate boundaries; `lichess` stays shakmaty-free and render-free.
+- Behavior changes need tests. Chess-rule behavior is guarded by integration tests
+  in `crates/client/tests/` plus a perft sanity check.
+- No `unwrap()` in hot paths.
+- 4-space indent, `snake_case`.
 
-## How to Build / Run / Test
+## Build / Run / Test
 
 ```bash
-cargo build            # build
-cargo run              # run the client
-cargo test             # run all tests (chess logic is well-covered)
+cargo build && cargo test && cargo run
+```
 
+App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `Esc` = close
+promotion menu.
 
-The app opens a window, connects to Lichess TV, and streams a live game.
-Press P → local play mode
-Press L → live spectator mode
-Roadmap (order matters)
+## Roadmap
+
 Completed:
-Real-time NDJSON streaming (replaced polling)
-Clocks + player names/ratings
-Pawn promotion menu (interactive, tested)
-CPU fix: event-driven rendering
-Board coordinates (a–h, 1–8)
-Draw rules: threefold repetition, 50-move rule, insufficient material, halfmove/fullmove counters + `to_fen`
-Online play: Board API (token auth, challenge a friend, NDJSON game stream, UCI replay + move posting)
-Up next:
-Interaction polish
-Actual playable games (Lichess API token auth + Board API)
+- [x] Real-time NDJSON streaming (replaced polling)
+- [x] Clocks + player names/ratings (+ freeze on game over)
+- [x] Pawn promotion menu (interactive, tested)
+- [x] Event-driven rendering (CPU fix)
+- [x] Board coordinates (in-square, Lichess-style)
+- [x] Flat rendering + solid piece outlines
 
-Rules for Agents
+In progress:
+- [ ] **Shakmaty migration** (3 stages below)
 
-1. Read this file first. Do not reverse or "simplify" the architectural decisions above.
-2. Prefer small, testable increments. Each change should build and pass cargo test.
-3. Don't add dependencies without a strong reason and alignment with the lightweight philosophy.
-4. Preserve the crate boundaries. If a change seems to require coupling two crates, reconsider the design.
-5. Update this file if you change architecture, add a crate, or complete a roadmap item.
+Next:
+- [ ] SVG piece sets via `resvg` (cburnett set, GPL-compatible) — own increment
+- [ ] Playable games (Lichess Board API + token auth; shakmaty gives UCI for free)
+- [ ] Theming — and only then `notify` for hot-reload
+
+## Migration Spec: shakmaty (execute in order, one commit per stage)
+
+### Stage 0 — prep
+- Workspace `Cargo.toml`: add to `[workspace.dependencies]`:
+  `shakmaty = { version = "0.30", features = ["variant"] }`, `thiserror = "2"`,
+  `anyhow = "1"`.
+- `lichess`: convert its hand-rolled `Error` enum to a `thiserror` derive.
+
+### Stage 1 — renderer speaks shakmaty (rendering only)
+- `renderer/Cargo.toml`: replace `chess` with `shakmaty`.
+- `text_pipeline.rs`: `piece_char(Role)`, `piece_tint(Color)`, `piece_outline(Color)`,
+  `push_piece(Role, Color, …)`; `prepare` iterates `shakmaty::Square::ALL` with
+  `pos.board().piece_at(sq)`; screen coords from index (`idx = sq as u8`,
+  `file = idx % 8`, `rank = idx / 8`, screen row = `7 - rank`).
+- `PieceElement`/`Scene` use `Role`/`Color`; the board field becomes
+  `&shakmaty::VariantPosition`.
+- `client` bridges its old `chess::Board` → shakmaty **for the render call only**
+  (throwaway code, removed in Stage 2).
+- Gate: `cargo test` green; `cargo run` renders identically to before.
+
+### Stage 2 — all state goes shakmaty; delete `crates/chess`
+- `ui`: every `Square`/`Color`/`PieceKind` becomes shakmaty `Square`/`Color`/`Role`;
+  `square_at` builds a `Square` from the computed index; `PROMOTION_KINDS: [Role; 4]`;
+  `promotion_at -> Option<Role>`; port its tests.
+- `client`: `board`/`live_board: VariantPosition`; `side: Color`; game-end matched on
+  `Outcome`/`is_checkmate()`/`is_stalemate()` at the banner; clicks use
+  `pos.legal_moves()` + `play_unchecked`; promotion detected via
+  `Move::Normal { promotion: Some(_), .. }`; FEN via `fen::Fen`; turn via `pos.turn()`.
+- **Delete `crates/chess`** (directory, workspace member, all `path` deps).
+- Port the old rule tests into `crates/client/tests/rules.rs` against shakmaty
+  (pin, en-passant-exposes-king, castling-through-check, SAN replay of the captured
+  live game) **plus** a perft sanity check: start position, depth 4 == 197281
+  (use `shakmaty::perft` if exposed, else a 5-line recursion over `legal_moves()`).
+- Gate: `cargo test` green; `cargo run` plays locally and streams live TV.
+
+### Stage 3 — variants light up
+- `lichess` worker: pass the channel/variant name through `NetEvent`; client builds
+  the matching variant position from the FEN; stop filtering to standard-only channels.
+- UI: ignore variant-specific move kinds (drops) for now — spectate only.
+- Tests: parse a horde FEN and an atomic FEN; `legal_moves()` doesn't panic; piece
+  counts sane.
+- Gate: `cargo test` green; `cargo run` cycles variant TV games without crashing.
+
+## Rules for Agents
+
+1. **Read this file first.** Do not reverse or "simplify" the locked decisions above.
+2. Execute **one migration stage at a time**; each ends with green tests + a commit.
+3. **No new dependencies** beyond those listed here without discussion.
+4. **Never reintroduce `crates/chess`** or hand-rolled chess rules.
+5. **Update this file** when a stage completes or the roadmap changes.
+```
