@@ -10,6 +10,7 @@ renderer = { path = "../renderer" }
 chess = { path = "../chess" }
 lichess = { path = "../lichess" }
 ui = { path = "../ui" }
+shakmaty.workspace = true
 
 winit.workspace = true
 pollster.workspace = true

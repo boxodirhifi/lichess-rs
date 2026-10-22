@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use shakmaty::{Color, Position, Role, Square};
 use wgpu::util::DeviceExt;
 use crate::quad_pipeline::CameraUniforms;
 
@@ -76,25 +77,25 @@ fn load_font_bytes() -> Option<Vec<u8>> {
     None
 }
 
-fn piece_char(kind: chess::PieceKind) -> char {
-    match kind {
-        chess::PieceKind::King => '\u{265A}',
-        chess::PieceKind::Queen => '\u{265B}',
-        chess::PieceKind::Rook => '\u{265C}',
-        chess::PieceKind::Bishop => '\u{265D}',
-        chess::PieceKind::Knight => '\u{265E}',
-        chess::PieceKind::Pawn => '\u{265F}',
+fn piece_char(role: Role) -> char {
+    match role {
+        Role::King => '\u{265A}',
+        Role::Queen => '\u{265B}',
+        Role::Rook => '\u{265C}',
+        Role::Bishop => '\u{265D}',
+        Role::Knight => '\u{265E}',
+        Role::Pawn => '\u{265F}',
     }
 }
 
-fn piece_tint(color: chess::Color) -> [f32; 4] {
+fn piece_tint(color: Color) -> [f32; 4] {
     match color {
-        chess::Color::White => [0.98, 0.98, 0.98, 1.0],
-        chess::Color::Black => [0.10, 0.10, 0.10, 1.0],
+        Color::White => [0.98, 0.98, 0.98, 1.0],
+        Color::Black => [0.10, 0.10, 0.10, 1.0],
     }
 }
 
-fn piece_outline(_color: chess::Color) -> [f32; 4] {
+fn piece_outline(_color: Color) -> [f32; 4] {
     // Both colors get the same dark outline for consistency.
     [0.20, 0.18, 0.16, 1.0]
 }
@@ -381,7 +382,7 @@ impl TextPipeline {
     pub fn prepare(
         &mut self,
         queue: &wgpu::Queue,
-        board: &chess::Board,
+        board: &shakmaty::variant::VariantPosition,
         offset_x: f32,
         offset_y: f32,
         sq: f32,
@@ -392,18 +393,23 @@ impl TextPipeline {
 
         // Pieces
         if sq > 0.0 {
-            for (square, piece) in board.iter() {
-                let file = square.file() as f32;
-                let rank = square.rank() as f32;
+            let board = board.board();
+            for square in Square::ALL {
+                let Some(piece) = board.piece_at(square) else {
+                    continue;
+                };
+                let idx = square as u8;
+                let file = (idx % 8) as f32;
+                let rank = (idx / 8) as f32;
                 let cx = offset_x + file * sq + sq * 0.5;
                 let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
-                self.push_piece(piece.kind, piece.color, cx, cy, sq);
+                self.push_piece(piece.role, piece.color, cx, cy, sq);
             }
         }
 
         // Extra pieces (promotion menu, captured material, ...)
         for p in pieces {
-            self.push_piece(p.kind, p.color, p.x, p.y, p.size);
+            self.push_piece(p.role, p.color, p.x, p.y, p.size);
         }
 
         // Texts
@@ -428,8 +434,8 @@ impl TextPipeline {
         }
     }
 
-    fn push_piece(&mut self, kind: chess::PieceKind, color: chess::Color, cx: f32, cy: f32, size: f32) {
-        let ch = piece_char(kind);
+    fn push_piece(&mut self, role: Role, color: Color, cx: f32, cy: f32, size: f32) {
+        let ch = piece_char(role);
         // Copy the glyph data out so the immutable borrow of self.glyphs
         // ends before we mutably borrow self to push vertices.
         let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));

@@ -110,7 +110,7 @@ Completed:
 - [x] Flat rendering + solid piece outlines
 
 In progress:
-- [ ] **Shakmaty migration** (3 stages below)
+- [ ] **Shakmaty migration** (Stages 0–1 done; Stages 2–3 below)
 
 Next:
 - [ ] SVG piece sets via `resvg` (cburnett set, GPL-compatible) — own increment
@@ -119,13 +119,13 @@ Next:
 
 ## Migration Spec: shakmaty (execute in order, one commit per stage)
 
-### Stage 0 — prep
+### Stage 0 — prep ✅
 - Workspace `Cargo.toml`: add to `[workspace.dependencies]`:
   `shakmaty = { version = "0.30", features = ["variant"] }`, `thiserror = "2"`,
   `anyhow = "1"`.
 - `lichess`: convert its hand-rolled `Error` enum to a `thiserror` derive.
 
-### Stage 1 — renderer speaks shakmaty (rendering only)
+### Stage 1 — renderer speaks shakmaty (rendering only) ✅
 - `renderer/Cargo.toml`: replace `chess` with `shakmaty`.
 - `text_pipeline.rs`: `piece_char(Role)`, `piece_tint(Color)`, `piece_outline(Color)`,
   `push_piece(Role, Color, …)`; `prepare` iterates `shakmaty::Square::ALL` with

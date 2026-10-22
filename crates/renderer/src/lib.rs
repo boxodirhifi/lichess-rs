@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use winit::window::Window;
 use winit::dpi::PhysicalSize;
-use chess::Board;
+use shakmaty::variant::VariantPosition;
+use shakmaty::{Color, Role};
 
 mod quad_pipeline;
 mod text_pipeline;
@@ -14,8 +15,8 @@ use text_pipeline::TextPipeline;
 /// and shadow treatment as the pieces on the board.
 #[derive(Debug, Clone, Copy)]
 pub struct PieceElement {
-    pub kind: chess::PieceKind,
-    pub color: chess::Color,
+    pub role: Role,
+    pub color: Color,
     /// Center of the piece, in screen pixels.
     pub x: f32,
     pub y: f32,
@@ -25,7 +26,7 @@ pub struct PieceElement {
 
 pub struct Scene<'a> {
     pub quads: &'a [Quad],
-    pub board: &'a Board,
+    pub board: &'a VariantPosition,
     pub board_offset: (f32, f32),
     pub square_size: f32,
     pub banner: Option<&'a str>,

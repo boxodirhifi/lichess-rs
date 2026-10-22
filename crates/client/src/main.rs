@@ -123,6 +123,40 @@ fn side_from_fen(fen: &str) -> chess::Color {
     }
 }
 
+// Stage 1 bridge: rendering speaks shakmaty, the rest of the app still uses
+// the local `chess` crate. These helpers disappear in Stage 2.
+fn to_shakmaty_color(color: chess::Color) -> shakmaty::Color {
+    match color {
+        chess::Color::White => shakmaty::Color::White,
+        chess::Color::Black => shakmaty::Color::Black,
+    }
+}
+
+fn to_shakmaty_role(kind: chess::PieceKind) -> shakmaty::Role {
+    match kind {
+        chess::PieceKind::Pawn => shakmaty::Role::Pawn,
+        chess::PieceKind::Knight => shakmaty::Role::Knight,
+        chess::PieceKind::Bishop => shakmaty::Role::Bishop,
+        chess::PieceKind::Rook => shakmaty::Role::Rook,
+        chess::PieceKind::Queen => shakmaty::Role::Queen,
+        chess::PieceKind::King => shakmaty::Role::King,
+    }
+}
+
+/// Rebuild the position as a shakmaty `VariantPosition` from the board's FEN.
+/// Stage 1 only handles standard chess; variant setup arrives in Stage 3.
+fn to_variant_position(board: &chess::Board) -> shakmaty::variant::VariantPosition {
+    let fen = board.to_fen();
+    shakmaty::fen::Fen::from_ascii(fen.as_bytes())
+        .ok()
+        .and_then(|fen| {
+            fen.into_position::<shakmaty::Chess>(shakmaty::CastlingMode::Standard)
+                .ok()
+                .map(shakmaty::variant::VariantPosition::from)
+        })
+        .unwrap_or_default()
+}
+
 fn format_clock(secs: f64) -> String {
     let secs = secs.max(0.0) as u64;
     format!("{:02}:{:02}", secs / 60, secs % 60)
@@ -788,8 +822,8 @@ impl ApplicationHandler<NetEvent> for App {
                 }
                 let pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
                     renderer::PieceElement {
-                        kind: c.kind,
-                        color: c.color,
+                        role: to_shakmaty_role(c.kind),
+                        color: to_shakmaty_color(c.color),
                         x: c.rect.x + c.rect.w * 0.5,
                         y: c.rect.y + c.rect.h * 0.5,
                         size: c.rect.h,
@@ -830,17 +864,20 @@ impl ApplicationHandler<NetEvent> for App {
                 };
                 let banner: Option<&str> = banner.as_deref();
 
+                let board = match self.mode {
+                    Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
+                    Mode::Local => &self.board,
+                    Mode::Play => match &self.online {
+                        Online::Active(game) => &game.board,
+                        _ => &self.board,
+                    },
+                };
+                let board = to_variant_position(board);
+
                 if let Some(rend) = self.renderer.as_mut() {
                     let scene = renderer::Scene {
                         quads: &quads,
-                        board: match self.mode {
-                            Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
-                            Mode::Local => &self.board,
-                            Mode::Play => match &self.online {
-                                Online::Active(game) => &game.board,
-                                _ => &self.board,
-                            },
-                        },
+                        board: &board,
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
                         banner,
