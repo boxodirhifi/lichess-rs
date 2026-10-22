@@ -9,22 +9,13 @@ const BASE: &str = "https://lichess.org";
 
 /// Errors are boxed: `ureq::Error` is very large (>270 bytes) and would
 /// make every `Result` carry that payload around.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("lichess http error: {0}")]
     Http(Box<ureq::Error>),
-    Io(std::io::Error),
+    #[error("lichess io/parse error: {0}")]
+    Io(#[from] std::io::Error),
 }
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Http(e) => write!(f, "lichess http error: {}", e),
-            Error::Io(e) => write!(f, "lichess io/parse error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl Error {
     /// The Board API game stream 404s for challenges the opponent has not
@@ -41,12 +32,6 @@ impl Error {
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
         Error::Http(Box::new(e))
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
     }
 }
 
