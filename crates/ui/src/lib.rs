@@ -1,3 +1,5 @@
+use shakmaty::{Color, Rank, Role, Square};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
     pub x: f32,
@@ -19,16 +21,16 @@ const PANEL_CELL: [f32; 3] = [0.86, 0.82, 0.74];
 #[derive(Debug, Clone, Copy)]
 pub struct PromotionChoice {
     pub rect: Rect,
-    pub kind: chess::PieceKind,
-    pub color: chess::Color,
+    pub role: Role,
+    pub color: Color,
 }
 
 #[derive(Default)]
 pub struct UI {
     pub squares: Vec<Rect>,
-    selected: Option<chess::Square>,
-    move_targets: Vec<chess::Square>,
-    checked_king: Option<chess::Square>,
+    selected: Option<Square>,
+    move_targets: Vec<Square>,
+    checked_king: Option<Square>,
     promotion: Option<Promotion>,
     screen_w: f32,
     screen_h: f32,
@@ -40,19 +42,14 @@ pub struct UI {
 
 /// An open promotion menu.
 struct Promotion {
-    from: chess::Square,
-    to: chess::Square,
-    color: chess::Color,
+    from: Square,
+    to: Square,
+    color: Color,
     choices: Vec<PromotionChoice>,
 }
 
 /// The pieces offered on promotion, in menu order.
-pub const PROMOTION_KINDS: [chess::PieceKind; 4] = [
-    chess::PieceKind::Queen,
-    chess::PieceKind::Rook,
-    chess::PieceKind::Bishop,
-    chess::PieceKind::Knight,
-];
+pub const PROMOTION_KINDS: [Role; 4] = [Role::Queen, Role::Rook, Role::Bishop, Role::Knight];
 
 impl UI {
     pub fn new() -> Self {
@@ -106,11 +103,11 @@ impl UI {
 
     /// Lay out the four menu cells along the file of `to`, in the margin next
     /// to the rank the pawn is moving onto.
-    fn layout_promotion_choices(&self, to: chess::Square, color: chess::Color) -> Vec<PromotionChoice> {
-        let file = to.file() as f32;
+    fn layout_promotion_choices(&self, to: Square, color: Color) -> Vec<PromotionChoice> {
+        let file = to.file().to_u32() as f32;
         let sq = self.sq_size;
         // Rank 8 is the top row of the screen, rank 1 the bottom one.
-        let above = to.rank() == 7;
+        let above = to.rank() == Rank::Eighth;
         let pad = sq * 0.12;
 
         // Vertical room outside the board. It is always at least one square
@@ -136,7 +133,7 @@ impl UI {
         PROMOTION_KINDS
             .iter()
             .enumerate()
-            .map(|(i, kind)| PromotionChoice {
+            .map(|(i, role)| PromotionChoice {
                 rect: Rect {
                     x: x + i as f32 * side,
                     y,
@@ -144,20 +141,20 @@ impl UI {
                     h: side,
                     color: PANEL_CELL,
                 },
-                kind: *kind,
+                role: *role,
                 color,
             })
             .collect()
     }
 
     /// Open the promotion menu for a pawn moving from `from` to `to`.
-    pub fn open_promotion(&mut self, from: chess::Square, to: chess::Square, color: chess::Color) {
+    pub fn open_promotion(&mut self, from: Square, to: Square, color: Color) {
         let choices = self.layout_promotion_choices(to, color);
         self.promotion = Some(Promotion { from, to, color, choices });
     }
 
     /// Close the menu, returning the pending promotion if one was open.
-    pub fn close_promotion(&mut self) -> Option<(chess::Square, chess::Square, chess::Color)> {
+    pub fn close_promotion(&mut self) -> Option<(Square, Square, Color)> {
         self.promotion.take().map(|p| (p.from, p.to, p.color))
     }
 
@@ -165,7 +162,7 @@ impl UI {
         self.promotion.is_some()
     }
 
-    pub fn promotion_from(&self) -> Option<chess::Square> {
+    pub fn promotion_from(&self) -> Option<Square> {
         self.promotion.as_ref().map(|p| p.from)
     }
 
@@ -207,9 +204,9 @@ impl UI {
     }
 
     /// Which menu cell, if any, is under the cursor.
-    pub fn promotion_at(&self, x: f32, y: f32) -> Option<chess::PieceKind> {
+    pub fn promotion_at(&self, x: f32, y: f32) -> Option<Role> {
         let p = self.promotion.as_ref()?;
-        p.choices.iter().find(|c| contains(&c.rect, x, y)).map(|c| c.kind)
+        p.choices.iter().find(|c| contains(&c.rect, x, y)).map(|c| c.role)
     }
 
     /// Clear any pending promotion (used when leaving play mode).
@@ -235,13 +232,13 @@ impl UI {
         }
     }
 
-    fn square_at_index(i: usize) -> chess::Square {
+    fn square_at_index(i: usize) -> Square {
         let row = i / 8;
         let col = i % 8;
-        chess::Square::from_file_rank(col as u8, (7 - row) as u8).unwrap()
+        Square::new(((7 - row) * 8 + col) as u32)
     }
 
-    pub fn square_at(&self, x: f32, y: f32) -> Option<chess::Square> {
+    pub fn square_at(&self, x: f32, y: f32) -> Option<Square> {
         let bx = x - self.offset_x;
         let by = y - self.offset_y;
         if bx < 0.0 || by < 0.0 || bx >= self.board_px || by >= self.board_px {
@@ -252,10 +249,10 @@ impl UI {
         if col >= 8 || row >= 8 {
             return None;
         }
-        chess::Square::from_file_rank(col as u8, (7 - row) as u8)
+        Some(Square::new(((7 - row) * 8 + col) as u32))
     }
 
-    pub fn select(&mut self, sq: chess::Square, targets: Vec<chess::Square>) {
+    pub fn select(&mut self, sq: Square, targets: Vec<Square>) {
         self.selected = Some(sq);
         self.move_targets = targets;
         self.apply_colors();
@@ -267,16 +264,16 @@ impl UI {
         self.apply_colors();
     }
 
-    pub fn set_checked_king(&mut self, sq: Option<chess::Square>) {
+    pub fn set_checked_king(&mut self, sq: Option<Square>) {
         self.checked_king = sq;
         self.apply_colors();
     }
 
-    pub fn selected_square(&self) -> Option<chess::Square> {
+    pub fn selected_square(&self) -> Option<Square> {
         self.selected
     }
 
-    pub fn is_move_target(&self, sq: chess::Square) -> bool {
+    pub fn is_move_target(&self, sq: Square) -> bool {
         self.move_targets.contains(&sq)
     }
 
@@ -296,8 +293,7 @@ fn contains(r: &Rect, x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chess::PieceKind;
-    use chess::Square;
+    use shakmaty::{File, Rank};
 
     fn ui_at(w: f32, h: f32) -> UI {
         let mut ui = UI::new();
@@ -311,33 +307,28 @@ mod tests {
         assert!(!ui.promotion_open());
         assert!(ui.promotion_quads(None).is_empty());
 
-        let from = Square::from_file_rank(4, 6).unwrap(); // e7
-        let to = Square::from_file_rank(4, 7).unwrap(); // e8
-        ui.open_promotion(from, to, chess::Color::White);
+        let from = Square::E7;
+        let to = Square::E8;
+        ui.open_promotion(from, to, Color::White);
 
         assert!(ui.promotion_open());
         assert_eq!(ui.promotion_from(), Some(from));
 
-        let kinds: Vec<PieceKind> = ui.promotion_choices().iter().map(|c| c.kind).collect();
+        let roles: Vec<Role> = ui.promotion_choices().iter().map(|c| c.role).collect();
         assert_eq!(
-            kinds,
-            vec![
-                PieceKind::Queen,
-                PieceKind::Rook,
-                PieceKind::Bishop,
-                PieceKind::Knight
-            ]
+            roles,
+            vec![Role::Queen, Role::Rook, Role::Bishop, Role::Knight]
         );
         for c in ui.promotion_choices() {
-            assert_eq!(c.color, chess::Color::White);
+            assert_eq!(c.color, Color::White);
         }
     }
 
     #[test]
     fn white_promotion_menu_sits_above_the_board() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(4, 7).unwrap(); // e8
-        ui.open_promotion(Square::from_file_rank(4, 6).unwrap(), to, chess::Color::White);
+        let to = Square::E8;
+        ui.open_promotion(Square::E7, to, Color::White);
 
         let (_, oy) = ui.board_offset();
         for c in ui.promotion_choices() {
@@ -350,24 +341,28 @@ mod tests {
     #[test]
     fn black_promotion_menu_sits_below_the_board() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(4, 0).unwrap(); // e1
-        ui.open_promotion(Square::from_file_rank(4, 1).unwrap(), to, chess::Color::Black);
+        let to = Square::E1;
+        ui.open_promotion(Square::E2, to, Color::Black);
 
         let (_, oy) = ui.board_offset();
         let board_bottom = oy + ui.square_size() * 8.0;
         for c in ui.promotion_choices() {
             assert!(c.rect.y >= board_bottom - 0.001, "menu overlaps the board");
         }
-        assert_eq!(ui.promotion_choices()[0].color, chess::Color::Black);
+        assert_eq!(ui.promotion_choices()[0].color, Color::Black);
     }
 
     #[test]
     fn menu_stays_on_screen_for_corner_files() {
-        for file in 0..8u8 {
+        for file in 0..8u32 {
             for &(w, h) in &[(1000.0, 1000.0), (1600.0, 900.0), (900.0, 1600.0)] {
                 let mut ui = ui_at(w, h);
-                let to = Square::from_file_rank(file, 7).unwrap();
-                ui.open_promotion(Square::from_file_rank(file, 6).unwrap(), to, chess::Color::White);
+                let to = Square::from_coords(File::new(file), Rank::Eighth);
+                ui.open_promotion(
+                    Square::from_coords(File::new(file), Rank::Seventh),
+                    to,
+                    Color::White,
+                );
                 for c in ui.promotion_choices() {
                     assert!(c.rect.x >= 0.0 && c.rect.x + c.rect.w <= w, "file {file} off-screen x");
                     assert!(c.rect.y >= 0.0 && c.rect.y + c.rect.h <= h, "file {file} off-screen y");
@@ -377,15 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn hit_testing_maps_cells_to_kinds() {
+    fn hit_testing_maps_cells_to_roles() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(2, 7).unwrap(); // c8
-        ui.open_promotion(Square::from_file_rank(2, 6).unwrap(), to, chess::Color::White);
+        let to = Square::C8;
+        ui.open_promotion(Square::C7, to, Color::White);
 
         for c in ui.promotion_choices() {
             let cx = c.rect.x + c.rect.w / 2.0;
             let cy = c.rect.y + c.rect.h / 2.0;
-            assert_eq!(ui.promotion_at(cx, cy), Some(c.kind));
+            assert_eq!(ui.promotion_at(cx, cy), Some(c.role));
         }
         // A click well outside the menu picks nothing.
         assert_eq!(ui.promotion_at(1000.0 - 5.0, 1000.0 - 5.0), None);
@@ -394,8 +389,8 @@ mod tests {
     #[test]
     fn hover_highlights_only_the_cell_under_the_cursor() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(4, 7).unwrap();
-        ui.open_promotion(Square::from_file_rank(4, 6).unwrap(), to, chess::Color::White);
+        let to = Square::E8;
+        ui.open_promotion(Square::E7, to, Color::White);
 
         let target = ui.promotion_choices()[2].rect; // bishop
         let quads = ui.promotion_quads(Some((target.x + 1.0, target.y + 1.0)));
@@ -409,10 +404,10 @@ mod tests {
     #[test]
     fn closing_the_menu_clears_it() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let from = Square::from_file_rank(0, 6).unwrap(); // a7
-        let to = Square::from_file_rank(0, 7).unwrap(); // a8
-        ui.open_promotion(from, to, chess::Color::White);
-        assert_eq!(ui.close_promotion(), Some((from, to, chess::Color::White)));
+        let from = Square::A7;
+        let to = Square::A8;
+        ui.open_promotion(from, to, Color::White);
+        assert_eq!(ui.close_promotion(), Some((from, to, Color::White)));
         assert!(!ui.promotion_open());
         assert!(ui.promotion_quads(None).is_empty());
         assert!(ui.promotion_choices().is_empty());
@@ -422,8 +417,8 @@ mod tests {
     #[test]
     fn resize_relayouts_the_menu_without_overlapping_the_board() {
         let mut ui = ui_at(1000.0, 1000.0);
-        let to = Square::from_file_rank(4, 7).unwrap(); // e8
-        ui.open_promotion(Square::from_file_rank(4, 6).unwrap(), to, chess::Color::White);
+        let to = Square::E8;
+        ui.open_promotion(Square::E7, to, Color::White);
 
         ui.layout(1400.0, 700.0);
         assert!(ui.promotion_open(), "resize should not drop a pending promotion");

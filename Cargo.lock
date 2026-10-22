@@ -315,14 +315,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "chess"
-version = "0.1.0"
-
-[[package]]
 name = "client"
 version = "0.1.0"
 dependencies = [
- "chess",
  "env_logger",
  "lichess",
  "log",
@@ -2272,7 +2267,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 name = "ui"
 version = "0.1.0"
 dependencies = [
- "chess",
+ "shakmaty",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 platform = { path = "../platform" }
 renderer = { path = "../renderer" }
-chess = { path = "../chess" }
 lichess = { path = "../lichess" }
 ui = { path = "../ui" }
 shakmaty.workspace = true

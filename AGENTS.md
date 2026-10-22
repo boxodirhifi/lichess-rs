@@ -110,7 +110,7 @@ Completed:
 - [x] Flat rendering + solid piece outlines
 
 In progress:
-- [ ] **Shakmaty migration** (Stages 0–1 done; Stages 2–3 below)
+- [ ] **Shakmaty migration** (Stages 0–2 done; Stage 3 below)
 
 Next:
 - [ ] SVG piece sets via `resvg` (cburnett set, GPL-compatible) — own increment
@@ -137,7 +137,7 @@ Next:
   (throwaway code, removed in Stage 2).
 - Gate: `cargo test` green; `cargo run` renders identically to before.
 
-### Stage 2 — all state goes shakmaty; delete `crates/chess`
+### Stage 2 — all state goes shakmaty; delete `crates/chess` ✅
 - `ui`: every `Square`/`Color`/`PieceKind` becomes shakmaty `Square`/`Color`/`Role`;
   `square_at` builds a `Square` from the computed index; `PROMOTION_KINDS: [Role; 4]`;
   `promotion_at -> Option<Role>`; port its tests.

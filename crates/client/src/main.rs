@@ -3,6 +3,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use shakmaty::fen::Fen;
+use shakmaty::uci::UciMove;
+use shakmaty::variant::VariantPosition;
+use shakmaty::{
+    CastlingMode, Chess, Color, KnownOutcome, Move, Outcome, Position, Role, Square,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +44,7 @@ pub enum NetEvent {
         wtime_ms: u64,
         btime_ms: u64,
         status: String,
-        winner: Option<chess::Color>,
+        winner: Option<Color>,
     },
     /// Incremental Board API state update.
     OnlineState {
@@ -46,7 +52,7 @@ pub enum NetEvent {
         wtime_ms: u64,
         btime_ms: u64,
         status: String,
-        winner: Option<chess::Color>,
+        winner: Option<Color>,
     },
     OnlineFailed {
         message: String,
@@ -64,8 +70,8 @@ enum Mode {
 /// An online game in progress.
 struct OnlineGame {
     game_id: String,
-    board: chess::Board,
-    my_color: chess::Color,
+    board: VariantPosition,
+    my_color: Color,
     white_name: String,
     black_name: String,
     white_rating: u32,
@@ -74,7 +80,7 @@ struct OnlineGame {
     black_clock: f64,
     last_update: Instant,
     game_over: bool,
-    winner: Option<chess::Color>,
+    winner: Option<Color>,
 }
 
 enum Online {
@@ -92,7 +98,7 @@ struct LiveGameInfo {
     black_rating: u32,
     white_clock: f64,
     black_clock: f64,
-    side_to_move: chess::Color,
+    side_to_move: Color,
     last_update: Instant,
     game_over: bool,
 }
@@ -103,58 +109,44 @@ struct App {
     renderer: Option<renderer::Renderer>,
     window: Option<Arc<Window>>,
     ui: ui::UI,
-    board: chess::Board,
-    live_board: Option<chess::Board>,
+    board: VariantPosition,
+    live_board: Option<VariantPosition>,
     live_info: Option<LiveGameInfo>,
     mode: Mode,
     cursor_pos: (f64, f64),
-    side: chess::Color,
-    status: chess::GameStatus,
+    side: Color,
     token: Option<String>,
     my_username: Option<String>,
     online: Online,
     online_error: Option<String>,
 }
 
-fn side_from_fen(fen: &str) -> chess::Color {
-    match fen.split_whitespace().nth(1) {
-        Some("b") => chess::Color::Black,
-        _ => chess::Color::White,
-    }
-}
-
-// Stage 1 bridge: rendering speaks shakmaty, the rest of the app still uses
-// the local `chess` crate. These helpers disappear in Stage 2.
-fn to_shakmaty_color(color: chess::Color) -> shakmaty::Color {
-    match color {
-        chess::Color::White => shakmaty::Color::White,
-        chess::Color::Black => shakmaty::Color::Black,
-    }
-}
-
-fn to_shakmaty_role(kind: chess::PieceKind) -> shakmaty::Role {
-    match kind {
-        chess::PieceKind::Pawn => shakmaty::Role::Pawn,
-        chess::PieceKind::Knight => shakmaty::Role::Knight,
-        chess::PieceKind::Bishop => shakmaty::Role::Bishop,
-        chess::PieceKind::Rook => shakmaty::Role::Rook,
-        chess::PieceKind::Queen => shakmaty::Role::Queen,
-        chess::PieceKind::King => shakmaty::Role::King,
-    }
-}
-
-/// Rebuild the position as a shakmaty `VariantPosition` from the board's FEN.
-/// Stage 1 only handles standard chess; variant setup arrives in Stage 3.
-fn to_variant_position(board: &chess::Board) -> shakmaty::variant::VariantPosition {
-    let fen = board.to_fen();
-    shakmaty::fen::Fen::from_ascii(fen.as_bytes())
+/// Parse a standard FEN into the app's variant-position type. The actual
+/// variant selection for TV arrives in Stage 3; today every game is standard.
+fn position_from_fen(fen: &str) -> Option<VariantPosition> {
+    Fen::from_ascii(fen.as_bytes())
         .ok()
-        .and_then(|fen| {
-            fen.into_position::<shakmaty::Chess>(shakmaty::CastlingMode::Standard)
-                .ok()
-                .map(shakmaty::variant::VariantPosition::from)
-        })
-        .unwrap_or_default()
+        .and_then(|fen| fen.into_position::<Chess>(CastlingMode::Standard).ok())
+        .map(VariantPosition::from)
+}
+
+/// `Move::to()` reports the rook square for castling; clicks and highlights
+/// work on the king's destination square.
+fn move_destination(mv: Move, pos: &VariantPosition) -> Square {
+    match mv {
+        Move::Castle { .. } => mv
+            .castling_side()
+            .map(|side| side.king_to(pos.turn()))
+            .unwrap_or_else(|| mv.to()),
+        _ => mv.to(),
+    }
+}
+
+fn color_name(color: Color) -> &'static str {
+    match color {
+        Color::White => "White",
+        Color::Black => "Black",
+    }
 }
 
 fn format_clock(secs: f64) -> String {
@@ -205,12 +197,44 @@ impl App {
     }
 
     fn refresh_check_highlight(&mut self) {
-        let checked = if self.board.in_check(self.side) {
-            self.board.king_square(self.side)
+        let checked = if self.board.is_check() {
+            self.board.board().king_of(self.side)
         } else {
             None
         };
         self.ui.set_checked_king(checked);
+    }
+
+    /// Local play accepts moves until shakmaty says the game is over (or the
+    /// 50-move counter has run out).
+    fn local_game_over(&self) -> bool {
+        self.board.outcome().is_known() || self.board.halfmoves() >= 100
+    }
+
+    /// Game-over text derived from shakmaty's outcome and terminal-state
+    /// predicates. No local game-status enum: the position is the truth.
+    fn local_banner(&self) -> Option<String> {
+        match self.board.outcome() {
+            Outcome::Known(KnownOutcome::Decisive { winner }) => {
+                Some(format!("Checkmate - {} wins", color_name(winner)))
+            }
+            Outcome::Known(KnownOutcome::Draw) => {
+                if self.board.is_stalemate() {
+                    Some("Stalemate - Draw".to_string())
+                } else if self.board.is_insufficient_material() {
+                    Some("Draw - insufficient material".to_string())
+                } else {
+                    Some("Draw".to_string())
+                }
+            }
+            Outcome::Unknown => {
+                if self.board.halfmoves() >= 100 {
+                    Some("Draw - 50-move rule".to_string())
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     fn build_texts(&self) -> Vec<renderer::TextElement> {
@@ -247,12 +271,12 @@ impl App {
         } else {
             game.last_update.elapsed().as_secs_f64()
         };
-        let white_clock = if game.board.side_to_move() == chess::Color::White {
+        let white_clock = if game.board.turn() == Color::White {
             (game.white_clock - elapsed).max(0.0)
         } else {
             game.white_clock
         };
-        let black_clock = if game.board.side_to_move() == chess::Color::Black {
+        let black_clock = if game.board.turn() == Color::Black {
             (game.black_clock - elapsed).max(0.0)
         } else {
             game.black_clock
@@ -398,12 +422,12 @@ impl App {
         } else {
             info.last_update.elapsed().as_secs_f64()
         };
-        let white_clock = if info.side_to_move == chess::Color::White {
+        let white_clock = if info.side_to_move == Color::White {
             (info.white_clock - elapsed).max(0.0)
         } else {
             info.white_clock
         };
-        let black_clock = if info.side_to_move == chess::Color::Black {
+        let black_clock = if info.side_to_move == Color::Black {
             (info.black_clock - elapsed).max(0.0)
         } else {
             info.black_clock
@@ -443,7 +467,7 @@ impl App {
     /// Play a completed promotion and return to normal play.
     /// Which board clicks operate on: the local one in local play, the
     /// online one while a Board API game is running.
-    fn active_board(&mut self) -> Option<&mut chess::Board> {
+    fn active_board(&mut self) -> Option<&mut VariantPosition> {
         match self.mode {
             Mode::Local => Some(&mut self.board),
             Mode::Play => match &mut self.online {
@@ -456,11 +480,11 @@ impl App {
 
     /// Post a played move to Lichess in the background; the board stream
     /// echoes it back, so the reply only needs logging.
-    fn post_online_move(&mut self, mv: chess::Move) {
+    fn post_online_move(&mut self, mv: Move) {
         let game_id = self.online_game().map(|game| game.game_id.clone());
         let Some(game_id) = game_id else { return };
         let Some(token) = self.token.clone() else { return };
-        let uci = mv.to_uci();
+        let uci = mv.to_uci(CastlingMode::Standard).to_string();
         std::thread::spawn(move || {
             if let Err(e) = lichess::play_board_move(&token, &game_id, &uci) {
                 log::warn!("Move post failed: {}", e);
@@ -476,33 +500,32 @@ impl App {
         }
     }
 
-    fn finish_promotion(&mut self, kind: chess::PieceKind) {
+    fn finish_promotion(&mut self, role: Role) {
         let Some((from, to, _)) = self.ui.close_promotion() else {
             return;
         };
-        let Some(mv) = self
-            .active_board()
-            .and_then(|board| {
-                board
-                    .legal_moves_from(from)
-                    .into_iter()
-                    .find(|m| m.to == to && m.promotion == Some(kind))
-            })
-        else {
-            self.ui.clear_selection();
-            return;
-        };
-        self.apply_move(mv);
+        let mv = self.active_board().and_then(|board| {
+            board
+                .legal_moves()
+                .into_iter()
+                .find(|&mv| {
+                    mv.from() == Some(from)
+                        && move_destination(mv, board) == to
+                        && mv.promotion() == Some(role)
+                })
+        });
+        if let Some(mv) = mv {
+            self.apply_move(mv);
+        }
         self.ui.clear_selection();
     }
 
     /// Apply a complete move to the active board: bookkeeping for local play,
     /// and a background POST for online play.
-    fn apply_move(&mut self, mv: chess::Move) {
+    fn apply_move(&mut self, mv: Move) {
         if self.mode == Mode::Local {
-            self.board.make_move(mv);
-            self.side = self.side.opposite();
-            self.status = self.board.status(self.side);
+            self.board.play_unchecked(mv);
+            self.side = self.board.turn();
             self.refresh_check_highlight();
         } else {
             self.post_online_move(mv);
@@ -517,7 +540,7 @@ impl App {
         // dismisses the menu and keeps the pawn selected.
         if self.ui.promotion_open() {
             match self.ui.promotion_at(x, y) {
-                Some(kind) => self.finish_promotion(kind),
+                Some(role) => self.finish_promotion(role),
                 None => {
                     self.ui.close_promotion();
                 }
@@ -529,11 +552,9 @@ impl App {
         // play accepts everything until the game ends; online play only my
         // side, only while the server says the game is still running.
         let my_turn = match self.mode {
-            Mode::Local => self.status == chess::GameStatus::Ongoing,
+            Mode::Local => !self.local_game_over(),
             Mode::Play => match self.online_game() {
-                Some(game) => {
-                    !game.game_over && game.board.side_to_move() == game.my_color
-                }
+                Some(game) => !game.game_over && game.board.turn() == game.my_color,
                 None => return,
             },
             Mode::Live => unreachable!(),
@@ -552,18 +573,20 @@ impl App {
                     .active_board()
                     .map(|board| {
                         board
-                            .legal_moves_from(from)
+                            .legal_moves()
                             .into_iter()
-                            .filter(|m| m.to == sq)
+                            .filter(|&mv| {
+                                mv.from() == Some(from) && move_destination(mv, board) == sq
+                            })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let promotion = candidates.iter().any(|m| m.promotion.is_some());
+                let promotion = candidates.iter().any(|mv| mv.promotion().is_some());
                 if promotion && my_turn {
                     // Let the player pick the piece before playing the move.
                     let mover_color = self
                         .active_board()
-                        .and_then(|board| board.piece_at(from))
+                        .and_then(|board| board.board().piece_at(from))
                         .map(|piece| piece.color);
                     if let Some(color) = mover_color {
                         self.ui.open_promotion(from, sq, color);
@@ -580,13 +603,23 @@ impl App {
             self.ui.clear_selection();
             return;
         }
-        if let Some(piece) = self.active_board().and_then(|board| board.piece_at(sq)) {
+        if let Some(piece) = self
+            .active_board()
+            .and_then(|board| board.board().piece_at(sq))
+        {
             if self.can_select_piece(piece.color) {
-                let mut targets: Vec<chess::Square> = self
+                let mut targets: Vec<Square> = self
                     .active_board()
-                    .map(|board| board.legal_moves_from(sq).iter().map(|m| m.to).collect())
+                    .map(|board| {
+                        board
+                            .legal_moves()
+                            .into_iter()
+                            .filter(|mv| mv.from() == Some(sq))
+                            .map(|mv| move_destination(mv, board))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                targets.sort_by_key(|s| s.index());
+                targets.sort();
                 targets.dedup();
                 self.ui.select(sq, targets);
                 return;
@@ -597,7 +630,7 @@ impl App {
 
     /// Selection rules: local play lets you pick either color; online play
     /// only your own pieces, while it is your turn.
-    fn can_select_piece(&self, color: chess::Color) -> bool {
+    fn can_select_piece(&self, color: Color) -> bool {
         match self.mode {
             Mode::Local => true,
             Mode::Play => self
@@ -630,7 +663,9 @@ impl ApplicationHandler<NetEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
         match event {
             NetEvent::FeaturedGame { fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs } => {
-                if let Some(board) = chess::Board::from_fen(&fen) {
+                let board = position_from_fen(&fen);
+                let side = board.as_ref().map(|board| board.turn()).unwrap_or(Color::White);
+                if let Some(board) = board {
                     self.live_board = Some(board);
                 }
                 self.live_info = Some(LiveGameInfo {
@@ -640,15 +675,15 @@ impl ApplicationHandler<NetEvent> for App {
                     black_rating,
                     white_clock: white_secs as f64,
                     black_clock: black_secs as f64,
-                    side_to_move: side_from_fen(&fen),
+                    side_to_move: side,
                     last_update: Instant::now(),
                     game_over: false,
                 });
             }
             NetEvent::FenUpdate { fen, white_secs, black_secs } => {
-                if let Some(board) = chess::Board::from_fen(&fen) {
-                    let side = side_from_fen(&fen);
-                    let terminal = !matches!(board.status(side), chess::GameStatus::Ongoing);
+                if let Some(board) = position_from_fen(&fen) {
+                    let side = board.turn();
+                    let terminal = board.outcome().is_known() || board.halfmoves() >= 100;
                     self.live_board = Some(board);
                     if let Some(info) = &mut self.live_info {
                         info.white_clock = white_secs as f64;
@@ -680,15 +715,14 @@ impl ApplicationHandler<NetEvent> for App {
                 let me = self.my_username.clone();
                 let mine = |name: &str| me.as_deref().is_some_and(|me| me.eq_ignore_ascii_case(name));
                 let my_color = if mine(&white_name) {
-                    chess::Color::White
+                    Color::White
                 } else {
-                    chess::Color::Black
+                    Color::Black
                 };
-                let board = match initial_fen.as_deref().unwrap_or("startpos") {
-                    "startpos" => chess::Board::starting_position(),
-                    fen => chess::Board::from_fen(fen).unwrap_or_else(chess::Board::starting_position),
+                let mut board = match initial_fen.as_deref().unwrap_or("startpos") {
+                    "startpos" => VariantPosition::default(),
+                    fen => position_from_fen(fen).unwrap_or_default(),
                 };
-                let mut board = board;
                 replay_uci(&mut board, &moves);
                 self.online = Online::Active(Box::new(OnlineGame {
                     game_id,
@@ -822,24 +856,15 @@ impl ApplicationHandler<NetEvent> for App {
                 }
                 let pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
                     renderer::PieceElement {
-                        role: to_shakmaty_role(c.kind),
-                        color: to_shakmaty_color(c.color),
+                        role: c.role,
+                        color: c.color,
                         x: c.rect.x + c.rect.w * 0.5,
                         y: c.rect.y + c.rect.h * 0.5,
                         size: c.rect.h,
                     }
                 }).collect();
                 let banner: Option<String> = match self.mode {
-                    Mode::Local => match self.status {
-                        chess::GameStatus::Checkmate(chess::Color::White) => Some("Checkmate - White wins"),
-                        chess::GameStatus::Checkmate(chess::Color::Black) => Some("Checkmate - Black wins"),
-                        chess::GameStatus::Stalemate => Some("Stalemate - Draw"),
-                        chess::GameStatus::FiftyMoveRule => Some("Draw - 50-move rule"),
-                        chess::GameStatus::ThreefoldRepetition => Some("Draw - threefold repetition"),
-                        chess::GameStatus::InsufficientMaterial => Some("Draw - insufficient material"),
-                        chess::GameStatus::Ongoing => None,
-                    }
-                    .map(|text| text.to_string()),
+                    Mode::Local => self.local_banner(),
                     Mode::Live => None,
                     Mode::Play => {
                         if let Some(error) = &self.online_error {
@@ -872,12 +897,11 @@ impl ApplicationHandler<NetEvent> for App {
                         _ => &self.board,
                     },
                 };
-                let board = to_variant_position(board);
 
                 if let Some(rend) = self.renderer.as_mut() {
                     let scene = renderer::Scene {
                         quads: &quads,
-                        board: &board,
+                        board,
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
                         banner,
@@ -966,12 +990,15 @@ fn read_opponent() -> Option<String> {
 
 /// Replay a full UCI move list (as the Board API stream sends it) onto a
 /// board, using the board's own side-to-move tracking.
-fn replay_uci(board: &mut chess::Board, moves: &str) {
+fn replay_uci(board: &mut VariantPosition, moves: &str) {
     for uci in moves.split_whitespace() {
-        let side = board.side_to_move();
-        match board.move_from_uci(uci, side) {
-            Some(mv) => board.make_move(mv),
-            None => {
+        let Ok(parsed) = UciMove::from_ascii(uci.as_bytes()) else {
+            log::warn!("UCI replay stopped at {}", uci);
+            break;
+        };
+        match parsed.to_move(board) {
+            Ok(mv) => board.play_unchecked(mv),
+            Err(_) => {
                 log::warn!("UCI replay stopped at {}", uci);
                 break;
             }
@@ -1033,8 +1060,8 @@ fn online_worker(proxy: EventLoopProxy<NetEvent>, token: String, opponent: Strin
 /// Map Board API stream events onto the app's event enum.
 fn forward_board_event(proxy: &EventLoopProxy<NetEvent>, event: lichess::BoardStreamEvent) {
     let color_of = |name: &str| match name.to_ascii_lowercase().as_str() {
-        "white" => Some(chess::Color::White),
-        "black" => Some(chess::Color::Black),
+        "white" => Some(Color::White),
+        "black" => Some(Color::Black),
         _ => None,
     };
     let send = match event {
@@ -1078,11 +1105,10 @@ fn main() {
         renderer: None,
         window: None,
         ui: ui::UI::new(),
-        board: chess::Board::starting_position(),
+        board: VariantPosition::default(),
         live_board: None,
         live_info: None,
-        side: chess::Color::White,
-        status: chess::GameStatus::Ongoing,
+        side: Color::White,
         mode: Mode::Live,
         cursor_pos: (0.0, 0.0),
         token: None,
@@ -1097,18 +1123,18 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// A board with a white pawn on the 7th rank, ready to promote.
-    fn app_with_promoting_pawn() -> App {
+    fn app_from_fen(fen: &str) -> App {
+        let board = position_from_fen(fen).expect("valid test FEN");
+        let side = board.turn();
         let mut app = App {
             proxy: None,
             renderer: None,
             window: None,
             ui: ui::UI::new(),
-            board: chess::Board::from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1").unwrap(),
+            board,
             live_board: None,
             live_info: None,
-            side: chess::Color::White,
-            status: chess::GameStatus::Ongoing,
+            side,
             mode: Mode::Local,
             cursor_pos: (0.0, 0.0),
             token: None,
@@ -1120,23 +1146,28 @@ mod tests {
         app
     }
 
+    /// A board with a white pawn on the 7th rank, ready to promote.
+    fn app_with_promoting_pawn() -> App {
+        app_from_fen("8/4P3/8/8/8/8/8/4K2k w - - 0 1")
+    }
+
     /// Center of a square in window coordinates.
-    fn square_center(app: &App, sq: chess::Square) -> (f32, f32) {
+    fn square_center(app: &App, sq: Square) -> (f32, f32) {
         let (ox, oy) = app.ui.board_offset();
         let s = app.ui.square_size();
         (
-            ox + (sq.file() as f32 + 0.5) * s,
-            oy + (7.0 - sq.rank() as f32 + 0.5) * s,
+            ox + (sq.file().to_u32() as f32 + 0.5) * s,
+            oy + (7.0 - sq.rank().to_u32() as f32 + 0.5) * s,
         )
     }
 
     /// Center of a promotion menu cell.
-    fn choice_center(app: &App, kind: chess::PieceKind) -> (f32, f32) {
+    fn choice_center(app: &App, role: Role) -> (f32, f32) {
         let cell = app
             .ui
             .promotion_choices()
             .iter()
-            .find(|c| c.kind == kind)
+            .find(|c| c.role == role)
             .expect("promotion choice missing");
         (
             cell.rect.x + cell.rect.w * 0.5,
@@ -1147,8 +1178,8 @@ mod tests {
     #[test]
     fn promoting_opens_the_menu_instead_of_moving() {
         let mut app = app_with_promoting_pawn();
-        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
-        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+        let e7 = Square::E7;
+        let e8 = Square::E8;
 
         let (x, y) = square_center(&app, e7);
         app.handle_board_click(x, y);
@@ -1161,19 +1192,19 @@ mod tests {
         assert_eq!(app.ui.promotion_from(), Some(e7));
         // The pawn has not moved yet.
         assert!(matches!(
-            app.board.piece_at(e7).map(|p| p.kind),
-            Some(chess::PieceKind::Pawn)
+            app.board.board().piece_at(e7).map(|p| p.role),
+            Some(Role::Pawn)
         ));
-        assert!(app.board.piece_at(e8).is_none());
+        assert!(app.board.board().piece_at(e8).is_none());
         // The game is still White's move.
-        assert_eq!(app.side, chess::Color::White);
+        assert_eq!(app.side, Color::White);
     }
 
     #[test]
     fn picking_a_choice_plays_that_piece() {
         let mut app = app_with_promoting_pawn();
-        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
-        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+        let e7 = Square::E7;
+        let e8 = Square::E8;
 
         let (x, y) = square_center(&app, e7);
         app.handle_board_click(x, y);
@@ -1181,29 +1212,29 @@ mod tests {
         app.handle_board_click(x, y);
         assert!(app.ui.promotion_open());
 
-        let (x, y) = choice_center(&app, chess::PieceKind::Knight);
+        let (x, y) = choice_center(&app, Role::Knight);
         app.handle_board_click(x, y);
 
         assert!(!app.ui.promotion_open(), "menu should close after picking");
-        assert!(app.board.piece_at(e7).is_none());
+        assert!(app.board.board().piece_at(e7).is_none());
         assert_eq!(
-            app.board.piece_at(e8).map(|p| (p.kind, p.color)),
-            Some((chess::PieceKind::Knight, chess::Color::White))
+            app.board.board().piece_at(e8).map(|p| (p.role, p.color)),
+            Some((Role::Knight, Color::White))
         );
-        assert_eq!(app.side, chess::Color::Black);
+        assert_eq!(app.side, Color::Black);
     }
 
     #[test]
     fn every_choice_produces_its_piece() {
         for kind in [
-            chess::PieceKind::Queen,
-            chess::PieceKind::Rook,
-            chess::PieceKind::Bishop,
-            chess::PieceKind::Knight,
+            Role::Queen,
+            Role::Rook,
+            Role::Bishop,
+            Role::Knight,
         ] {
             let mut app = app_with_promoting_pawn();
-            let e7 = chess::Square::from_file_rank(4, 6).unwrap();
-            let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+            let e7 = Square::E7;
+            let e8 = Square::E8;
 
             let (x, y) = square_center(&app, e7);
             app.handle_board_click(x, y);
@@ -1214,7 +1245,7 @@ mod tests {
             app.handle_board_click(x, y);
 
             assert_eq!(
-                app.board.piece_at(e8).map(|p| p.kind),
+                app.board.board().piece_at(e8).map(|p| p.role),
                 Some(kind),
                 "wrong piece for {kind:?}"
             );
@@ -1224,8 +1255,8 @@ mod tests {
     #[test]
     fn clicking_away_from_the_menu_dismisses_it() {
         let mut app = app_with_promoting_pawn();
-        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
-        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+        let e7 = Square::E7;
+        let e8 = Square::E8;
 
         let (x, y) = square_center(&app, e7);
         app.handle_board_click(x, y);
@@ -1240,8 +1271,8 @@ mod tests {
         // The pawn is still on the 7th rank and still selected, so the player
         // can pick another piece without re-selecting.
         assert!(matches!(
-            app.board.piece_at(e7).map(|p| p.kind),
-            Some(chess::PieceKind::Pawn)
+            app.board.board().piece_at(e7).map(|p| p.role),
+            Some(Role::Pawn)
         ));
         assert_eq!(app.ui.selected_square(), Some(e7));
     }
@@ -1249,8 +1280,8 @@ mod tests {
     #[test]
     fn closing_the_menu_keeps_the_pawn_selected() {
         let mut app = app_with_promoting_pawn();
-        let e7 = chess::Square::from_file_rank(4, 6).unwrap();
-        let e8 = chess::Square::from_file_rank(4, 7).unwrap();
+        let e7 = Square::E7;
+        let e8 = Square::E8;
 
         let (x, y) = square_center(&app, e7);
         app.handle_board_click(x, y);
@@ -1262,45 +1293,73 @@ mod tests {
         app.ui.close_promotion();
         assert!(!app.ui.promotion_open());
         assert!(matches!(
-            app.board.piece_at(e7).map(|p| p.kind),
-            Some(chess::PieceKind::Pawn)
+            app.board.board().piece_at(e7).map(|p| p.role),
+            Some(Role::Pawn)
         ));
         assert_eq!(app.ui.selected_square(), Some(e7));
     }
 
     #[test]
     fn replay_uci_applies_moves_with_side_to_move() {
-        let mut board = chess::Board::starting_position();
+        let mut board = VariantPosition::default();
         replay_uci(&mut board, "e2e4 g8f6 b1c3");
-        assert_eq!(board.side_to_move(), chess::Color::Black);
-        let c3 = chess::Square::from_file_rank(2, 2).unwrap();
+        assert_eq!(board.turn(), Color::Black);
         assert_eq!(
-            board.piece_at(c3).map(|p| p.kind),
-            Some(chess::PieceKind::Knight)
+            board.board().piece_at(Square::C3).map(|p| p.role),
+            Some(Role::Knight)
         );
 
+        // Standard UCI castling is king-to-destination.
+        let mut board = VariantPosition::default();
+        replay_uci(&mut board, "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 e1g1");
+        assert_eq!(
+            board.board().piece_at(Square::G1).map(|p| p.role),
+            Some(Role::King)
+        );
+        assert_eq!(board.turn(), Color::Black);
+
         // Unknown moves stop the replay instead of panicking.
-        let mut board = chess::Board::starting_position();
+        let mut board = VariantPosition::default();
         replay_uci(&mut board, "e2e4 nonsense e7e5");
-        assert_eq!(board.side_to_move(), chess::Color::Black);
+        assert_eq!(board.turn(), Color::Black);
+    }
+
+    #[test]
+    fn clicking_the_king_destination_castles() {
+        let mut app = app_from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1");
+
+        let (x, y) = square_center(&app, Square::E1);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::G1);
+        app.handle_board_click(x, y);
+
+        assert_eq!(
+            app.board.board().piece_at(Square::G1).map(|p| p.role),
+            Some(Role::King)
+        );
+        assert_eq!(
+            app.board.board().piece_at(Square::F1).map(|p| p.role),
+            Some(Role::Rook)
+        );
+        assert!(app.board.board().piece_at(Square::H1).is_none());
+        assert_eq!(app.side, Color::Black);
     }
 
     #[test]
     fn ordinary_still_moves_immediately() {
-        let mut app = app_with_promoting_pawn();
-        let d2 = chess::Square::from_file_rank(3, 1).unwrap();
-        let d4 = chess::Square::from_file_rank(3, 3).unwrap();
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let d2 = Square::D2;
+        let d4 = Square::D4;
 
         // A pawn on d2 is not promoting, so a two-square push just happens.
-        app.board.set_piece(d2, Some(chess::Piece::new(chess::PieceKind::Pawn, chess::Color::White)));
         let (x, y) = square_center(&app, d2);
         app.handle_board_click(x, y);
         let (x, y) = square_center(&app, d4);
         app.handle_board_click(x, y);
 
         assert!(!app.ui.promotion_open());
-        assert!(app.board.piece_at(d4).is_some());
-        assert_eq!(app.side, chess::Color::Black);
+        assert!(app.board.board().piece_at(d4).is_some());
+        assert_eq!(app.side, Color::Black);
     }
 
     /// Text element whose contents match `needle`.
@@ -1314,7 +1373,7 @@ mod tests {
     fn app_with_live_game() -> App {
         let mut app = app_with_promoting_pawn();
         app.mode = Mode::Live;
-        app.live_board = Some(chess::Board::starting_position());
+        app.live_board = Some(VariantPosition::default());
         app.live_info = Some(LiveGameInfo {
             white_name: "White".to_string(),
             black_name: "Black".to_string(),
@@ -1322,7 +1381,7 @@ mod tests {
             black_rating: 1600,
             white_clock: 300.0,
             black_clock: 300.0,
-            side_to_move: chess::Color::White,
+            side_to_move: Color::White,
             last_update: Instant::now(),
             game_over: false,
         });

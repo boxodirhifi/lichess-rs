@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/chess",
     "crates/lichess",
     "crates/platform",
     "crates/renderer",
