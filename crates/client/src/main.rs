@@ -705,6 +705,48 @@ impl App {
             Mode::Live => false,
         }
     }
+
+    /// Left button pressed: run the ordinary click handling, then remember a
+    /// drag when that press selected a piece. A press that already played a
+    /// move (clicking a highlighted target) clears the selection and so never
+    /// starts a drag.
+    fn handle_mouse_press(&mut self, x: f32, y: f32) {
+        self.handle_board_click(x, y);
+        if self.mode == Mode::Live {
+            return;
+        }
+        let Some(sq) = self.ui.square_at(x, y) else {
+            return;
+        };
+        if self.ui.selected_square() == Some(sq) {
+            self.ui.start_drag(sq, x, y);
+        }
+    }
+
+    /// Cursor movement; returns true when a redraw is needed so the dragged
+    /// piece follows the pointer.
+    fn handle_cursor_moved(&mut self, x: f32, y: f32) -> bool {
+        self.cursor_pos = (x as f64, y as f64);
+        if !self.ui.is_dragging() {
+            return false;
+        }
+        self.ui.drag_to(x, y)
+    }
+
+    /// Left button released: a real drag resolves like a click on the release
+    /// square — legal target plays (or opens the promotion menu), anything
+    /// else clears the selection. A press/release without movement stays a
+    /// plain click and keeps the selection.
+    fn handle_mouse_release(&mut self, x: f32, y: f32) -> bool {
+        if !self.ui.is_dragging() {
+            return false;
+        }
+        if self.ui.drag_moved() {
+            self.handle_board_click(x, y);
+        }
+        self.ui.end_drag();
+        true
+    }
 }
 
 impl ApplicationHandler<NetEvent> for App {
@@ -876,16 +918,19 @@ impl ApplicationHandler<NetEvent> for App {
                 needs_redraw = true;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = (position.x, position.y);
-                // Only redraw on mouse move if we need to update the promotion hover highlight
-                if self.ui.promotion_open() {
-                    needs_redraw = true;
-                }
+                // Dragging needs a redraw on every move (the piece follows the
+                // cursor); promotion hover is the other cursor-driven visual.
+                let dragging = self.handle_cursor_moved(position.x as f32, position.y as f32);
+                needs_redraw = dragging || self.ui.promotion_open();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let (x, y) = self.cursor_pos;
-                self.handle_board_click(x as f32, y as f32);
+                self.handle_mouse_press(x as f32, y as f32);
                 needs_redraw = true;
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                let (x, y) = self.cursor_pos;
+                needs_redraw = self.handle_mouse_release(x as f32, y as f32);
             }
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
@@ -986,6 +1031,27 @@ impl ApplicationHandler<NetEvent> for App {
                     },
                 };
 
+                // Once a press turns into a real drag, lift the piece off its
+                // square and let it follow the cursor. A plain click keeps the
+                // board untouched (the piece is only hidden from the moment
+                // the pointer leaves the click slop).
+                let dragged = if self.ui.is_dragging() && self.ui.drag_moved() {
+                    self.ui.dragging_piece(board).map(|(from, role, color)| {
+                        (
+                            from,
+                            renderer::PieceElement {
+                                role,
+                                color,
+                                x: self.cursor_pos.0 as f32,
+                                y: self.cursor_pos.1 as f32,
+                                size: self.ui.square_size(),
+                            },
+                        )
+                    })
+                } else {
+                    None
+                };
+
                 if let Some(rend) = self.renderer.as_mut() {
                     let scene = renderer::Scene {
                         quads: &quads,
@@ -995,6 +1061,7 @@ impl ApplicationHandler<NetEvent> for App {
                         banner,
                         texts: &texts,
                         pieces: &pieces,
+                        dragged,
                     };
                     rend.render(&scene);
                 }
@@ -1565,6 +1632,156 @@ mod tests {
         assert!(!app.ui.promotion_open());
         assert!(app.board.board().piece_at(d4).is_some());
         assert_eq!(app.side, Color::Black);
+    }
+
+    #[test]
+    fn drag_start_selects_and_lifts_the_piece() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let e2 = Square::E2;
+
+        let (x, y) = square_center(&app, e2);
+        app.handle_mouse_press(x, y);
+
+        assert_eq!(app.ui.selected_square(), Some(e2));
+        assert_eq!(app.ui.dragging_square(), Some(e2));
+        assert!(app.ui.is_dragging());
+        assert!(!app.ui.drag_moved(), "the press alone is not a drag yet");
+        assert_eq!(
+            app.ui.dragging_piece(&app.board),
+            Some((e2, Role::Pawn, Color::White))
+        );
+        // The legal targets are already highlighted while dragging.
+        assert!(app.ui.is_move_target(Square::E4));
+    }
+
+    #[test]
+    fn drag_release_over_a_legal_target_plays_the_move() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let e2 = Square::E2;
+        let e4 = Square::E4;
+
+        let (x, y) = square_center(&app, e2);
+        app.handle_mouse_press(x, y);
+        let (x, y) = square_center(&app, e4);
+        assert!(app.handle_cursor_moved(x, y), "the followed cursor needs a redraw");
+        assert!(app.ui.drag_moved());
+
+        assert!(app.handle_mouse_release(x, y));
+        assert_eq!(
+            app.board.board().piece_at(e4).map(|p| (p.role, p.color)),
+            Some((Role::Pawn, Color::White))
+        );
+        assert!(app.board.board().piece_at(e2).is_none());
+        assert_eq!(app.side, Color::Black);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_square(), None);
+    }
+
+    #[test]
+    fn drag_release_elsewhere_cancels_the_move() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let e2 = Square::E2;
+
+        // Released on an unrelated square: the pawn goes back and the
+        // selection clears.
+        let (px, py) = square_center(&app, e2);
+        app.handle_mouse_press(px, py);
+        let (x, y) = square_center(&app, Square::A3);
+        app.handle_cursor_moved(x, y);
+        app.handle_mouse_release(x, y);
+
+        assert_eq!(
+            app.board.board().piece_at(e2).map(|p| p.role),
+            Some(Role::Pawn)
+        );
+        assert!(app.board.board().piece_at(Square::A3).is_none());
+        assert_eq!(app.side, Color::White);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_square(), None);
+
+        // Released outside the board does the same.
+        let (px, py) = square_center(&app, e2);
+        app.handle_mouse_press(px, py);
+        app.handle_cursor_moved(2.0, 2.0);
+        app.handle_mouse_release(2.0, 2.0);
+
+        assert!(app.board.board().piece_at(e2).is_some());
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_square(), None);
+    }
+
+    #[test]
+    fn a_click_is_still_a_click() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let e2 = Square::E2;
+        let e4 = Square::E4;
+
+        // Press and release in place: click-to-select keeps working and the
+        // drag must not clear the selection.
+        let (x, y) = square_center(&app, e2);
+        app.handle_mouse_press(x, y);
+        assert!(app.handle_mouse_release(x, y));
+        assert_eq!(app.ui.selected_square(), Some(e2));
+        assert!(!app.ui.is_dragging());
+
+        // The second click on a highlighted square plays the move, exactly as
+        // before, and does not start a drag of the released piece.
+        let (x, y) = square_center(&app, e4);
+        app.handle_mouse_press(x, y);
+        assert!(app.board.board().piece_at(e4).is_some());
+        assert!(!app.ui.is_dragging());
+        app.handle_mouse_release(x, y);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_square(), None);
+    }
+
+    #[test]
+    fn dragging_a_pawn_to_the_last_rank_opens_the_promotion_menu() {
+        let mut app = app_with_promoting_pawn();
+        let e7 = Square::E7;
+        let e8 = Square::E8;
+
+        let (x, y) = square_center(&app, e7);
+        app.handle_mouse_press(x, y);
+        let (x, y) = square_center(&app, e8);
+        app.handle_cursor_moved(x, y);
+        app.handle_mouse_release(x, y);
+
+        assert!(app.ui.promotion_open(), "menu opens on release, as with a click");
+        assert_eq!(app.ui.promotion_from(), Some(e7));
+        assert!(!app.ui.is_dragging());
+        // The pawn has not moved yet: the choice picks the promotion piece.
+        assert!(matches!(
+            app.board.board().piece_at(e7).map(|p| p.role),
+            Some(Role::Pawn)
+        ));
+        assert!(app.board.board().piece_at(e8).is_none());
+
+        let (x, y) = choice_center(&app, Role::Knight);
+        app.handle_board_click(x, y);
+        assert!(!app.ui.promotion_open());
+        assert_eq!(
+            app.board.board().piece_at(e8).map(|p| (p.role, p.color)),
+            Some((Role::Knight, Color::White))
+        );
+    }
+
+    #[test]
+    fn dragging_does_nothing_in_live_mode() {
+        let mut app = app_with_live_game();
+        let e2 = Square::E2;
+
+        let (x, y) = square_center(&app, e2);
+        app.handle_mouse_press(x, y);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_square(), None);
+
+        let (x, y) = square_center(&app, Square::E4);
+        assert!(!app.handle_cursor_moved(x, y));
+        assert!(!app.handle_mouse_release(x, y));
+        assert!(!app.ui.is_dragging());
+        assert!(app.live_board.as_ref().expect("live board").board().piece_at(e2).is_some());
+        assert!(app.live_board.as_ref().expect("live board").board().piece_at(Square::E4).is_none());
     }
 
     /// Text element whose contents match `needle`.

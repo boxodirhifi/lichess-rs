@@ -2,7 +2,7 @@ use std::sync::Arc;
 use winit::window::Window;
 use winit::dpi::PhysicalSize;
 use shakmaty::variant::VariantPosition;
-use shakmaty::{Color, Role};
+use shakmaty::{Color, Role, Square};
 
 mod piece_pipeline;
 mod quad_pipeline;
@@ -37,6 +37,9 @@ pub struct Scene<'a> {
     pub texts: &'a [TextElement],
     /// Extra pieces to draw (e.g. a promotion menu); drawn after the board pieces.
     pub pieces: &'a [PieceElement],
+    /// A piece being dragged: the board square to leave out, plus the element
+    /// to draw under the cursor. Drawn last, so it floats above the board.
+    pub dragged: Option<(Square, PieceElement)>,
 }
 
 pub struct Renderer {
@@ -156,6 +159,7 @@ impl Renderer {
             scene.board_offset.1,
             scene.square_size,
             scene.pieces,
+            scene.dragged,
         );
         self.text_pipeline.prepare(&self.queue, &all_texts);
 

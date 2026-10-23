@@ -354,7 +354,9 @@ impl PiecePipeline {
     }
 
     /// Upload the whole piece scene (board pieces + extras such as the
-    /// promotion menu) to the GPU.
+    /// promotion menu, plus the piece currently under the cursor).
+    // Parameter list mirrors the board part of `Scene`; flat by design.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         queue: &wgpu::Queue,
@@ -363,11 +365,18 @@ impl PiecePipeline {
         offset_y: f32,
         sq: f32,
         pieces: &[PieceElement],
+        dragged: Option<(shakmaty::Square, PieceElement)>,
     ) {
         self.vertices.clear();
 
+        // The dragged piece's origin square is skipped, so the piece exists
+        // only under the cursor while it is being moved.
+        let origin = dragged.map(|(from, _)| from);
         if sq > 0.0 {
             for square in shakmaty::Square::ALL {
+                if origin == Some(square) {
+                    continue;
+                }
                 let Some(piece) = board.board().piece_at(square) else {
                     continue;
                 };
@@ -381,6 +390,12 @@ impl PiecePipeline {
         }
 
         for p in pieces {
+            self.push_piece(p.role, p.color, p.x, p.y, p.size);
+        }
+
+        // Last, so the dragged piece is on top of every other piece (only the
+        // text pass, i.e. the game-over banner, draws after this pipeline).
+        if let Some((_, p)) = dragged {
             self.push_piece(p.role, p.color, p.x, p.y, p.size);
         }
 

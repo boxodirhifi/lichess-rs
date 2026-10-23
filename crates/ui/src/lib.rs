@@ -1,4 +1,5 @@
-use shakmaty::{Color, Rank, Role, Square};
+use shakmaty::variant::VariantPosition;
+use shakmaty::{Color, Position, Rank, Role, Square};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -31,6 +32,12 @@ pub struct UI {
     selected: Option<Square>,
     move_targets: Vec<Square>,
     checked_king: Option<Square>,
+    /// Square the piece being dragged came from, while the mouse is down.
+    dragging: Option<Square>,
+    drag_origin: Option<(f32, f32)>,
+    /// Whether the cursor has left the click slop since `start_drag`; a press
+    /// and release without movement stays a plain click.
+    drag_moved: bool,
     promotion: Option<Promotion>,
     screen_w: f32,
     screen_h: f32,
@@ -277,6 +284,56 @@ impl UI {
         self.move_targets.contains(&sq)
     }
 
+    /// Begin dragging the selected piece on `sq`; `(x, y)` is the press
+    /// position, used as the click-vs-drag origin.
+    pub fn start_drag(&mut self, sq: Square, x: f32, y: f32) {
+        self.dragging = Some(sq);
+        self.drag_origin = Some((x, y));
+        self.drag_moved = false;
+    }
+
+    /// Follow the cursor. Returns true once the cursor has moved beyond the
+    /// click slop, i.e. this is a real drag rather than a click.
+    pub fn drag_to(&mut self, x: f32, y: f32) -> bool {
+        if let (Some((ox, oy)), Some(_)) = (self.drag_origin, self.dragging) {
+            let slop = (self.sq_size * 0.12).max(3.0);
+            if (x - ox).abs() > slop || (y - oy).abs() > slop {
+                self.drag_moved = true;
+            }
+        }
+        self.drag_moved
+    }
+
+    /// Finish a drag, whether it played a move or was cancelled.
+    pub fn end_drag(&mut self) {
+        self.dragging = None;
+        self.drag_origin = None;
+        self.drag_moved = false;
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    /// True once the press has turned into an actual drag; the renderer only
+    /// hides the board piece at that point.
+    pub fn drag_moved(&self) -> bool {
+        self.drag_moved
+    }
+
+    pub fn dragging_square(&self) -> Option<Square> {
+        self.dragging
+    }
+
+    /// The piece under drag, looked up on the board being displayed.
+    pub fn dragging_piece(&self, board: &VariantPosition) -> Option<(Square, Role, Color)> {
+        let sq = self.dragging?;
+        board
+            .board()
+            .piece_at(sq)
+            .map(|piece| (sq, piece.role, piece.color))
+    }
+
     pub fn board_offset(&self) -> (f32, f32) {
         (self.offset_x, self.offset_y)
     }
@@ -437,5 +494,37 @@ mod tests {
             (ui.square_size() * 8.0 - 800.0).abs() < 0.001,
             "board should fill 80% of the smaller window dimension"
         );
+    }
+
+    #[test]
+    fn drag_tracks_the_piece_and_the_cursor() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        let board = VariantPosition::default();
+        assert_eq!(ui.dragging_piece(&board), None);
+
+        ui.select(Square::E2, vec![Square::E3, Square::E4]);
+        ui.start_drag(Square::E2, 100.0, 100.0);
+        assert!(ui.is_dragging());
+        assert!(!ui.drag_moved(), "a fresh press is not a drag yet");
+        assert_eq!(ui.dragging_square(), Some(Square::E2));
+        assert_eq!(
+            ui.dragging_piece(&board),
+            Some((Square::E2, Role::Pawn, Color::White))
+        );
+
+        // A wobbly click stays inside the slop...
+        assert!(!ui.drag_to(102.0, 101.0));
+        // ...but leaving the square-size slop turns it into a drag.
+        assert!(ui.drag_to(400.0, 100.0));
+        // The selection survives, so the move targets stay highlighted.
+        assert_eq!(ui.selected_square(), Some(Square::E2));
+        assert!(ui.is_move_target(Square::E4));
+
+        ui.end_drag();
+        assert!(!ui.is_dragging());
+        assert!(!ui.drag_moved());
+        assert_eq!(ui.dragging_piece(&board), None);
+        // Ending a drag never touches the selection; the client decides.
+        assert_eq!(ui.selected_square(), Some(Square::E2));
     }
 }

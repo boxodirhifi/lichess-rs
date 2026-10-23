@@ -85,6 +85,12 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    of their square. Board = 80% of the min window dimension. No outer gutter.
 7. **Text is flat.** No drop shadows, except the game-over banner which overlays the
    board (`TextElement.shadow = true` only there).
+8. **Click-to-move and drag-to-move share one path.** Press runs the click handler,
+   then arms a drag if the press selected a piece; release resolves a drag (only
+   after the cursor left the click slop) through the same `handle_board_click`, so
+   targets, promotion and clearing behave identically. The dragged piece is
+   `Scene.dragged`: the piece pipeline skips its origin square and draws it last
+   (only the text pass — the banner — comes after).
 
 ## Coding Conventions
 
@@ -102,7 +108,8 @@ cargo build && cargo test && cargo run
 ```
 
 App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `Esc` = close
-promotion menu.
+promotion menu. Pieces move by click-click or drag-and-drop (press a piece, drag to
+a legal target, release); a press/release without moving stays a plain click.
 
 ## Roadmap
 
@@ -117,6 +124,8 @@ Completed:
 - [x] Spectating all Lichess TV variants (`Stage 3`: channel → shakmaty variant)
 - [x] SVG piece sets (cburnett set via `resvg`, GPL-compatible) — bundled SVGs
   rasterized at init into a wgpu atlas, replacing glyph pieces
+- [x] Drag-to-move alongside click-to-move (drag origin lifted off the board,
+  rendered under the cursor; promotion still picked by click)
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
