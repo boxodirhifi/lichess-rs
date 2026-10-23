@@ -24,7 +24,7 @@ Workspace crates (post-migration):
 | Crate | Responsibility |
 |---|---|
 | `client` | The binary. Event loop, app state, wires everything together. |
-| `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text + piece glyphs today). |
+| `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text), SVG piece atlas (cburnett set). |
 | `ui` | Layout & interaction geometry: squares, selection, move targets, promotion menu, coordinates. |
 | `platform` | Window creation & Wayland/X11 integration via `winit`. |
 | `lichess` | REST (`ureq`) + real-time NDJSON streaming. Returns plain data (FEN/SAN strings, player info). Never touches `shakmaty` or rendering. |
@@ -71,10 +71,15 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    end of `window_event` — that caused a 100%-CPU unbounded loop before.
 4. **Clocks trust the server.** Display exact `wc`/`bc` values; freeze via
    `LiveGameInfo.game_over` when the game ends. No client-side interpolation.
-5. **Pieces are Unicode glyphs** rasterized via `ab_glyph` into a GPU atlas, drawn
-   with a solid 8-offset outline (Lichess/Chess.com-style contrast). Planned upgrade:
-   real SVG piece sets via `resvg` (separate increment — see Roadmap). Keep the glyph
-   path until then.
+5. **Pieces are real SVG piece sets (cburnett), not glyphs.** The 12 cburnett
+   SVGs are bundled under `crates/renderer/assets/cburnett/` (`include_str!`) and
+   rasterized once at renderer init with pure-Rust `resvg` (no fonts needed:
+   `default-features = false`), packed into one `Rgba8UnormSrgb` texture atlas
+   (4×3 cells of 256 px), and drawn through `PiecePipeline` as straight-alpha
+   blended textured quads — no tint, no stamped outline; the SVG carries the
+   colors. Board pieces and promotion-menu pieces share this path
+   (`PieceElement.role/color` index the atlas). The `ab_glyph` pipeline stays
+   for text only (coordinates, names, clocks, banner).
 6. **Coordinates are in-square, Lichess-style:** files `a–h` bottom-left of rank-1
    squares, ranks `1–8` top-right of h-file squares, tinted with the opposite color
    of their square. Board = 80% of the min window dimension. No outer gutter.
@@ -110,6 +115,8 @@ Completed:
 - [x] Board coordinates (in-square, Lichess-style)
 - [x] Flat rendering + solid piece outlines
 - [x] Spectating all Lichess TV variants (`Stage 3`: channel → shakmaty variant)
+- [x] SVG piece sets (cburnett set via `resvg`, GPL-compatible) — bundled SVGs
+  rasterized at init into a wgpu atlas, replacing glyph pieces
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -118,7 +125,6 @@ Known limitations:
   `halfmoves() >= 100`.
 
 Next:
-- [ ] SVG piece sets via `resvg` (cburnett set, GPL-compatible) — own increment
 - [ ] Finish playable online games. Scaffolding already in the client:
   token auth (`~/.config/lichess-rs/token`, `Mode::Play`), challenge creation +
   Board API game stream (`stream_board_game`), move posting (`play_board_move`),

@@ -23,6 +23,10 @@ raw-window-handle = "0.6"
 glam = "0.29"
 bytemuck = { version = "1.19", features = [ "derive" ] }
 ab_glyph = "0.2"
+# Pure-Rust SVG rasterization for the piece set. `default-features = false`
+# drops the text/system-font stack (fontdb, fontconfig): the cburnett
+# piece SVGs are pure vector shapes, no <text>.
+resvg = { version = "0.47", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }

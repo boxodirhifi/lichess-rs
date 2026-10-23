@@ -4,15 +4,19 @@ use winit::dpi::PhysicalSize;
 use shakmaty::variant::VariantPosition;
 use shakmaty::{Color, Role};
 
+mod piece_pipeline;
 mod quad_pipeline;
 mod text_pipeline;
+pub use piece_pipeline::rasterize_piece;
 pub use quad_pipeline::Quad;
 pub use text_pipeline::{TextAlign, TextElement};
+use piece_pipeline::PiecePipeline;
 use quad_pipeline::QuadPipeline;
 use text_pipeline::TextPipeline;
 
-/// A single piece drawn at an arbitrary screen position, using the same glyph
-/// and shadow treatment as the pieces on the board.
+/// A single piece drawn at an arbitrary screen position (e.g. the promotion
+/// menu). Board pieces come from the position itself; both go through the
+/// same SVG-atlas textured-quad path.
 #[derive(Debug, Clone, Copy)]
 pub struct PieceElement {
     pub role: Role,
@@ -20,7 +24,7 @@ pub struct PieceElement {
     /// Center of the piece, in screen pixels.
     pub x: f32,
     pub y: f32,
-    /// Nominal size in pixels; the glyph is scaled to ~0.82 of this, like a square.
+    /// Edge length in pixels; the piece fills its square.
     pub size: f32,
 }
 
@@ -43,6 +47,7 @@ pub struct Renderer {
     #[allow(dead_code)]
     window: Arc<Window>,
     quad_pipeline: QuadPipeline,
+    piece_pipeline: PiecePipeline,
     text_pipeline: TextPipeline,
 }
 
@@ -88,9 +93,12 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let quad_pipeline = QuadPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
+        // SVG piece atlas: 12 cburnett SVGs rasterized here, on the main
+        // thread, in milliseconds.
+        let piece_pipeline = PiecePipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
         let text_pipeline = TextPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
 
-        Self { surface, device, queue, config, window, quad_pipeline, text_pipeline }
+        Self { surface, device, queue, config, window, quad_pipeline, piece_pipeline, text_pipeline }
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -99,6 +107,7 @@ impl Renderer {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.quad_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
+            self.piece_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
             self.text_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
         }
     }
@@ -140,15 +149,15 @@ impl Renderer {
         }
 
         self.quad_pipeline.prepare(&self.queue, scene.quads);
-        self.text_pipeline.prepare(
+        self.piece_pipeline.prepare(
             &self.queue,
             scene.board,
             scene.board_offset.0,
             scene.board_offset.1,
             scene.square_size,
             scene.pieces,
-            &all_texts,
         );
+        self.text_pipeline.prepare(&self.queue, &all_texts);
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -169,6 +178,7 @@ impl Renderer {
                 timestamp_writes: None,
             });
             self.quad_pipeline.draw(&mut pass);
+            self.piece_pipeline.draw(&mut pass);
             self.text_pipeline.draw(&mut pass);
         }
         self.queue.submit(std::iter::once(encoder.finish()));

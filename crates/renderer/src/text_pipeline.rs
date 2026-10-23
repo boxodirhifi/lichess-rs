@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use shakmaty::{Color, Position, Role, Square};
 use wgpu::util::DeviceExt;
 use crate::quad_pipeline::CameraUniforms;
 
@@ -77,29 +76,6 @@ fn load_font_bytes() -> Option<Vec<u8>> {
     None
 }
 
-fn piece_char(role: Role) -> char {
-    match role {
-        Role::King => '\u{265A}',
-        Role::Queen => '\u{265B}',
-        Role::Rook => '\u{265C}',
-        Role::Bishop => '\u{265D}',
-        Role::Knight => '\u{265E}',
-        Role::Pawn => '\u{265F}',
-    }
-}
-
-fn piece_tint(color: Color) -> [f32; 4] {
-    match color {
-        Color::White => [0.98, 0.98, 0.98, 1.0],
-        Color::Black => [0.10, 0.10, 0.10, 1.0],
-    }
-}
-
-fn piece_outline(_color: Color) -> [f32; 4] {
-    // Both colors get the same dark outline for consistency.
-    [0.20, 0.18, 0.16, 1.0]
-}
-
 impl TextPipeline {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, width: f32, height: f32) -> Self {
         let font_bytes = load_font_bytes()
@@ -108,11 +84,8 @@ impl TextPipeline {
         let scale = PxScale::from(RASTER_HEIGHT);
         let scaled = font.as_scaled(scale);
 
-        // ASCII printable range + the filled chess glyphs.
-        let mut chars: Vec<char> = (32u8..=126u8).map(|b| b as char).collect();
-        for ch in ['\u{265A}', '\u{265B}', '\u{265C}', '\u{265D}', '\u{265E}', '\u{265F}'] {
-            chars.push(ch);
-        }
+        // ASCII printable range; piece glyphs are SVG textures now.
+        let chars: Vec<char> = (32u8..=126u8).map(|b| b as char).collect();
 
         let mut atlas_data = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
         let mut glyphs = HashMap::new();
@@ -376,41 +349,13 @@ impl TextPipeline {
         w
     }
 
-    // One entry point that uploads the whole text/piece scene to the GPU;
-    // parameter count mirrors `Scene`, so it stays flat by design.
-    #[allow(clippy::too_many_arguments)]
+    // One entry point that uploads the whole text scene to the GPU.
     pub fn prepare(
         &mut self,
         queue: &wgpu::Queue,
-        board: &shakmaty::variant::VariantPosition,
-        offset_x: f32,
-        offset_y: f32,
-        sq: f32,
-        pieces: &[crate::PieceElement],
         texts: &[TextElement],
     ) {
         self.vertices.clear();
-
-        // Pieces
-        if sq > 0.0 {
-            let board = board.board();
-            for square in Square::ALL {
-                let Some(piece) = board.piece_at(square) else {
-                    continue;
-                };
-                let idx = square as u8;
-                let file = (idx % 8) as f32;
-                let rank = (idx / 8) as f32;
-                let cx = offset_x + file * sq + sq * 0.5;
-                let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
-                self.push_piece(piece.role, piece.color, cx, cy, sq);
-            }
-        }
-
-        // Extra pieces (promotion menu, captured material, ...)
-        for p in pieces {
-            self.push_piece(p.role, p.color, p.x, p.y, p.size);
-        }
 
         // Texts
         for t in texts {
@@ -432,37 +377,6 @@ impl TextPipeline {
         if !self.vertices.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
         }
-    }
-
-    fn push_piece(&mut self, role: Role, color: Color, cx: f32, cy: f32, size: f32) {
-        let ch = piece_char(role);
-        // Copy the glyph data out so the immutable borrow of self.glyphs
-        // ends before we mutably borrow self to push vertices.
-        let glyph = self.glyphs.get(&ch).map(|g| (g.uv, g.width, g.height));
-        let Some((uv, gw, gh)) = glyph else {
-            return;
-        };
-        let scale = (size * 0.82) / RASTER_HEIGHT;
-        let w = gw * scale;
-        let h = gh * scale;
-        let x0 = cx - w * 0.5;
-        let y0 = cy - h * 0.5;
-
-        // Solid border: stamp the glyph in the outline colour in a ring
-        // around the piece, then the tinted fill on top. This is what keeps
-        // white pieces readable on light squares (and black on dark), the
-        // same trick the Lichess/Chess.com piece sets use.
-        let t = (size * 0.03).clamp(1.0, 2.5);
-        let outline = piece_outline(color);
-        const RING: [(f32, f32); 8] = {
-            const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
-            [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-             (D, D), (D, -D), (-D, D), (-D, -D)]
-        };
-        for (dx, dy) in RING {
-            self.push_quad(x0 + dx * t, y0 + dy * t, w, h, uv, outline);
-        }
-        self.push_quad(x0, y0, w, h, uv, piece_tint(color));
     }
 
     fn push_text(&mut self, text: &str, x: f32, baseline_y: f32, scale: f32, color: [f32; 4]) {
