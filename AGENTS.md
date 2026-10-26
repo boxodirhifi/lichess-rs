@@ -91,6 +91,27 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    targets, promotion and clearing behave identically. The dragged piece is
    `Scene.dragged`: the piece pipeline skips its origin square and draws it last
    (only the text pass — the banner — comes after).
+9. **The last-move highlight is recorded locally and derived in spectate.** `ui`
+   holds `last_move: Option<(Square, Square)>` and tints both squares muted yellow,
+   under the check → selected → target priorities. Local/Play record the move as it
+   is applied (`mv.from()`, `move_destination(mv, pos)` so castling lands on the
+   king's destination). TV only receives FENs, so
+   `derive_played_move(prev, next)` replays every `prev.legal_moves()` on a clone and
+   returns the single move whose `board()` matches `next.board()`. No match (missed
+   events, channel rotation) clears the tint rather than guessing; `FeaturedGame`,
+   mode switches and new games clear it. Crazyhouse drops have no origin square, so
+   they are never highlighted.
+10. **Captured material is a stateless count-diff; history is one SAN list.** For
+   each `(Role, Color)` the tray shows `max(0, start_count − board_count)`, with
+   `start_count` read from the variant's own default position (`Chess`, `Horde`, …),
+   so a reconnect can never leave stale pieces. Standard values (P1 N3 B3 R5 Q9) give
+   the lead, appended to the leading side's clock text (`"05:00 +14"`). Icons are
+   ordinary `Scene.pieces` at 0.4× square, started after the measured player name
+   (`Renderer::text_width`) and truncated by `tray_fit` before the right-aligned
+   clock. Promotions make the counts approximate (see Known limitations).
+   `App.history` keeps SAN (`San::from_move`) for the last ~30 plies and renders a
+   right-side column only when the board leaves ≥300 px of spare width — no
+   scrolling, no input, no PGN export.
 
 ## Coding Conventions
 
@@ -126,12 +147,21 @@ Completed:
   rasterized at init into a wgpu atlas, replacing glyph pieces
 - [x] Drag-to-move alongside click-to-move (drag origin lifted off the board,
   rendered under the cursor; promotion still picked by click)
+- [x] **Phase A polish**: last-move highlight in Local/Live/Play (derived from FEN
+  diffs while spectating), captured-piece trays + `+N` material next to the leading
+  clock, and a SAN move-history column when the window leaves ≥300 px of spare width
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
   history), so a threefold draw can only be detected with a history tracker (e.g.
   a repetition hash per position). The 50-move banner *is* tracked via
-  `halfmoves() >= 100`.
+  `halfmoves() >= 100`. `App.history` stores rendered SAN strings for the panel, not
+  positions, so it can't drive repetition detection.
+- **Promotions make the captured count-diff approximate.** A promoted pawn is
+  missing from the board, so the tray reads it as captured, and the promoted piece
+  reads as a captured enemy piece. Spectate mode has no true move history to correct
+  this (moves are derived from FEN diffs), so expect up to one pawn unit of drift per
+  promotion; online play is close but not exact either.
 
 Next:
 - [ ] Finish playable online games. Scaffolding already in the client:

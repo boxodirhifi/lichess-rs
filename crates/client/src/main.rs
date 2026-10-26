@@ -4,6 +4,7 @@ use winit::window::{Window, WindowId};
 use winit::event::{WindowEvent, MouseButton, ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use shakmaty::fen::Fen;
+use shakmaty::san::San;
 use shakmaty::uci::UciMove;
 use shakmaty::FromSetup;
 use shakmaty::variant::{
@@ -126,6 +127,9 @@ struct App {
     my_username: Option<String>,
     online: Online,
     online_error: Option<String>,
+    /// SAN of every move seen in the current game, oldest first. Rebuilt only
+    /// from applied/derived moves; cleared on a new game or a mode switch.
+    history: Vec<String>,
 }
 
 /// Map a Lichess TV channel key to its shakmaty variant. `Variant::from_ascii`
@@ -210,6 +214,143 @@ fn variant_end_text(board: &VariantPosition) -> String {
 fn format_clock(secs: f64) -> String {
     let secs = secs.max(0.0) as u64;
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+/// Material values in pawn units; the king is never captured in normal play.
+fn role_value(role: Role) -> i32 {
+    match role {
+        Role::Pawn => 1,
+        Role::Knight | Role::Bishop => 3,
+        Role::Rook => 5,
+        Role::Queen => 9,
+        Role::King => 0,
+    }
+}
+
+/// The reference position for the captured-material count-diff: the variant's
+/// own starting position (Horde starts with its pawn wall, Racing Kings without
+/// pawns, and so on).
+fn variant_start(variant: Variant) -> VariantPosition {
+    match variant {
+        Variant::Chess => Chess::default().into(),
+        Variant::Atomic => Atomic::default().into(),
+        Variant::Antichess => Antichess::default().into(),
+        Variant::Crazyhouse => Crazyhouse::default().into(),
+        Variant::Horde => Horde::default().into(),
+        Variant::KingOfTheHill => KingOfTheHill::default().into(),
+        Variant::ThreeCheck => ThreeCheck::default().into(),
+        Variant::RacingKings => RacingKings::default().into(),
+    }
+}
+
+fn piece_count(pos: &VariantPosition, color: Color, role: Role) -> u32 {
+    Square::ALL
+        .iter()
+        .filter(|&&sq| {
+            pos.board()
+                .piece_at(sq)
+                .is_some_and(|p| p.color == color && p.role == role)
+        })
+        .count() as u32
+}
+
+/// Captured material, derived statelessly by counting what is missing from the
+/// variant's starting position. Because nothing is accumulated, a reconnect or
+/// a channel rotation can never leave stale pieces in the tray.
+///
+/// Approximation: promotions upset the counts (a promoted white pawn reads as a
+/// captured white pawn *and* a captured black pawn), so trays can be off by one
+/// pawn unit per promotion. Spectate mode sees no moves history to correct it;
+/// online games are close because promotions are rare (see AGENTS.md).
+struct Captures {
+    /// Black pieces White captured, in tray order.
+    by_white: Vec<Role>,
+    /// White pieces Black captured, in tray order.
+    by_black: Vec<Role>,
+    /// Material lead in pawn units; positive means White is ahead.
+    advantage: i32,
+}
+
+impl Captures {
+    fn of(pos: &VariantPosition) -> Self {
+        let start = variant_start(pos.variant());
+        let mut by_white = Vec::new();
+        let mut by_black = Vec::new();
+        let mut white_points = 0;
+        let mut black_points = 0;
+
+        // Pawns first, then ascending value, like a Lichess tray.
+        for role in [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen] {
+            let value = role_value(role);
+            let black_missing = piece_count(&start, Color::Black, role)
+                .saturating_sub(piece_count(pos, Color::Black, role));
+            let white_missing = piece_count(&start, Color::White, role)
+                .saturating_sub(piece_count(pos, Color::White, role));
+            for _ in 0..black_missing {
+                by_white.push(role);
+                white_points += value;
+            }
+            for _ in 0..white_missing {
+                by_black.push(role);
+                black_points += value;
+            }
+        }
+
+        Self { by_white, by_black, advantage: white_points - black_points }
+    }
+}
+
+/// The move that took `prev` to `next`, if exactly one legal move explains the
+/// new piece placement. Used for TV, where only FENs arrive: a missed move (or
+/// a new game) makes every candidate fail the comparison, so nothing is
+/// highlighted rather than something wrong.
+fn derive_played_move(prev: &VariantPosition, next: &VariantPosition) -> Option<Move> {
+    for mv in prev.legal_moves() {
+        let mut probe = prev.clone();
+        probe.play_unchecked(mv);
+        if probe.board() == next.board() {
+            return Some(mv);
+        }
+    }
+    None
+}
+
+fn derive_last_move(prev: &VariantPosition, next: &VariantPosition) -> Option<(Square, Square)> {
+    let mv = derive_played_move(prev, next)?;
+    // Variant-only moves (Crazyhouse drops) have no origin square.
+    Some((mv.from()?, move_destination(mv, prev)))
+}
+
+/// How many captured-piece icons fit in the row from `start` to `end`.
+/// Truncates instead of colliding with the clock.
+fn tray_fit(start: f32, end: f32, count: usize, icon: f32, gap: f32) -> usize {
+    let mut fit = 0;
+    let mut x = start;
+    while fit < count && x + icon <= end {
+        fit += 1;
+        x += icon + gap;
+    }
+    fit
+}
+
+/// Clock text with the material lead appended for the leading side.
+fn clock_with_advantage(secs: f64, advantage: i32) -> String {
+    if advantage > 0 {
+        format!("{} +{}", format_clock(secs), advantage)
+    } else {
+        format_clock(secs)
+    }
+}
+
+/// One player bar above/below the board (Live and Play modes).
+struct PlayerBar {
+    label: String,
+    /// Clock text, carrying "+N" for the side that leads on material.
+    clock: String,
+    /// Opponent-coloured pieces this player captured, in tray order.
+    captured: Vec<Role>,
+    /// Text baseline.
+    y: f32,
 }
 
 /// Coordinates are tinted with the opposite colour of the square they sit on,
@@ -305,93 +446,244 @@ impl App {
     fn build_texts(&self) -> Vec<renderer::TextElement> {
         let mut texts = Vec::new();
         self.push_coordinates(&mut texts);
-        if self.mode == Mode::Live {
-            self.push_player_info(&mut texts);
-        }
-        if self.mode == Mode::Play {
-            self.push_online_info(&mut texts);
-        }
+        self.push_player_bars(&mut texts);
+        self.push_move_history(&mut texts);
         texts
     }
 
-    /// Player bars for the online game, black above the board and white
-    /// below it, in the same style as the spectator bars.
-    fn push_online_info(&self, texts: &mut Vec<renderer::TextElement>) {
-        let game = match &self.online {
-            Online::Active(game) => game,
-            _ => return,
+    /// The two player bars (black above the board, white below) for the mode
+    /// being displayed, with clocks and captured material. Local play has no
+    /// bars, so it returns `None`.
+    fn player_bars(&self) -> Option<[PlayerBar; 2]> {
+        let sq = self.ui.square_size();
+        if sq <= 0.0 {
+            return None;
+        }
+        let board_px = sq * 8.0;
+        let (_, oy) = self.ui.board_offset();
+        let font_size = (sq * 0.35).max(14.0);
+        let top_y = oy - font_size * 0.4;
+        let bottom_y = oy + board_px + font_size * 1.1;
+
+        let (black_label, white_label, black_clock, white_clock, board) = match self.mode {
+            Mode::Local => return None,
+            Mode::Live => {
+                let info = self.live_info.as_ref()?;
+                let board = self.live_board.as_ref().unwrap_or(&self.board);
+                // Freeze the clocks once the game is over so they don't drain.
+                let elapsed = if info.game_over {
+                    0.0
+                } else {
+                    info.last_update.elapsed().as_secs_f64()
+                };
+                let white_clock = if info.side_to_move == Color::White {
+                    (info.white_clock - elapsed).max(0.0)
+                } else {
+                    info.white_clock
+                };
+                let black_clock = if info.side_to_move == Color::Black {
+                    (info.black_clock - elapsed).max(0.0)
+                } else {
+                    info.black_clock
+                };
+                (
+                    format!("{} ({})", info.black_name, info.black_rating),
+                    format!("{} ({})", info.white_name, info.white_rating),
+                    black_clock,
+                    white_clock,
+                    board,
+                )
+            }
+            Mode::Play => {
+                let game = self.online_game()?;
+                let elapsed = if game.game_over {
+                    0.0
+                } else {
+                    game.last_update.elapsed().as_secs_f64()
+                };
+                let white_clock = if game.board.turn() == Color::White {
+                    (game.white_clock - elapsed).max(0.0)
+                } else {
+                    game.white_clock
+                };
+                let black_clock = if game.board.turn() == Color::Black {
+                    (game.black_clock - elapsed).max(0.0)
+                } else {
+                    game.black_clock
+                };
+                let mine = |name: &str| {
+                    self.my_username
+                        .as_deref()
+                        .is_some_and(|user| user.eq_ignore_ascii_case(name))
+                };
+                let star = |name: &str| if mine(name) { " *" } else { "" };
+                (
+                    format!(
+                        "{} ({}){}",
+                        game.black_name,
+                        game.black_rating,
+                        star(&game.black_name)
+                    ),
+                    format!(
+                        "{} ({}){}",
+                        game.white_name,
+                        game.white_rating,
+                        star(&game.white_name)
+                    ),
+                    black_clock,
+                    white_clock,
+                    &game.board,
+                )
+            }
         };
 
+        // Count-diff against the variant's start: black's missing pieces are
+        // what White captured, and vice versa.
+        let captures = Captures::of(board);
+        Some([
+            PlayerBar {
+                label: black_label,
+                clock: clock_with_advantage(black_clock, (-captures.advantage).max(0)),
+                captured: captures.by_black,
+                y: top_y,
+            },
+            PlayerBar {
+                label: white_label,
+                clock: clock_with_advantage(white_clock, captures.advantage.max(0)),
+                captured: captures.by_white,
+                y: bottom_y,
+            },
+        ])
+    }
+
+    fn push_player_bars(&self, texts: &mut Vec<renderer::TextElement>) {
+        let Some(bars) = self.player_bars() else {
+            return;
+        };
         let sq = self.ui.square_size();
-        let board_px = sq * 8.0;
-        let (ox, oy) = self.ui.board_offset();
-        let left = ox;
-        let right = ox + board_px;
         let font_size = (sq * 0.35).max(14.0);
+        let (ox, _) = self.ui.board_offset();
+        let left = ox;
+        let right = ox + sq * 8.0;
         let white = [1.0, 1.0, 1.0, 1.0];
 
-        // Same server-truth freeze rule as spectating.
-        let elapsed = if game.game_over {
-            0.0
-        } else {
-            game.last_update.elapsed().as_secs_f64()
-        };
-        let white_clock = if game.board.turn() == Color::White {
-            (game.white_clock - elapsed).max(0.0)
-        } else {
-            game.white_clock
-        };
-        let black_clock = if game.board.turn() == Color::Black {
-            (game.black_clock - elapsed).max(0.0)
-        } else {
-            game.black_clock
-        };
-
-        let mine = |name: &str| -> bool {
-            self.my_username
-                .as_deref()
-                .map(|user| user.eq_ignore_ascii_case(name))
-                .unwrap_or(false)
-        };
-        let label = |name: &str, rating: u32| -> String {
-            let star = if mine(name) { " *" } else { "" };
-            format!("{name} ({rating}){star}")
-        };
-
-        // Black's bar sits above the board, white's below it.
-        let bars = [
-            (
-                game.black_name.clone(),
-                game.black_rating,
-                black_clock,
-                left,
-                oy - font_size * 0.4,
-            ),
-            (
-                game.white_name.clone(),
-                game.white_rating,
-                white_clock,
-                left,
-                oy + board_px + font_size * 1.1,
-            ),
-        ];
-        for (name, rating, clock, label_x, y) in bars {
+        for bar in bars {
             texts.push(renderer::TextElement {
-                text: label(&name, rating),
-                x: label_x,
-                y,
+                text: bar.label,
+                x: left,
+                y: bar.y,
                 size: font_size,
                 color: white,
                 align: renderer::TextAlign::Left,
                 shadow: false,
             });
             texts.push(renderer::TextElement {
-                text: format_clock(clock),
+                text: bar.clock,
                 x: right,
-                y,
+                y: bar.y,
                 size: font_size,
                 color: white,
                 align: renderer::TextAlign::Right,
+                shadow: false,
+            });
+        }
+    }
+
+    /// Captured-piece icons for both bars, laid out after the name and kept
+    /// clear of the right-aligned clock. Uses the existing `Scene.pieces` path.
+    fn push_captured_icons(
+        &self,
+        rend: &renderer::Renderer,
+        out: &mut Vec<renderer::PieceElement>,
+    ) {
+        let Some(bars) = self.player_bars() else {
+            return;
+        };
+        let sq = self.ui.square_size();
+        let font_size = (sq * 0.35).max(14.0);
+        let (ox, _) = self.ui.board_offset();
+        let left = ox;
+        let right = ox + sq * 8.0;
+        let icon = sq * 0.4;
+        let gap = sq * 0.015;
+        let pad = font_size * 0.6;
+
+        // Black's bar holds the white pieces it captured, white's the black.
+        for (bar, color) in bars.iter().zip([Color::White, Color::Black]) {
+            let start = left + rend.text_width(&bar.label, font_size) + pad;
+            let end = right - rend.text_width(&bar.clock, font_size) - pad;
+            let fit = tray_fit(start, end, bar.captured.len(), icon, gap);
+            let mut x = start;
+            for role in bar.captured.iter().take(fit) {
+                out.push(renderer::PieceElement {
+                    role: *role,
+                    color,
+                    x: x + icon * 0.5,
+                    y: bar.y - font_size * 0.33,
+                    size: icon,
+                });
+                x += icon + gap;
+            }
+        }
+    }
+
+    /// Where the move-history column starts, and its font size, when the
+    /// window leaves at least 300 px of spare space to the right of the board.
+    fn history_panel(&self) -> Option<(f32, f32)> {
+        let sq = self.ui.square_size();
+        if sq <= 0.0 {
+            return None;
+        }
+        let (ox, _) = self.ui.board_offset();
+        // The board is centred, so the right margin equals the left offset.
+        if ox < 300.0 {
+            return None;
+        }
+        let font_size = (ox * 0.05).clamp(12.0, 24.0);
+        Some((ox + sq * 8.0 + 24.0, font_size))
+    }
+
+    /// The last ~30 plies as `1. e4 e5` rows in the spare space right of the
+    /// board. Purely informational: no scrolling, no input, no PGN export.
+    fn push_move_history(&self, texts: &mut Vec<renderer::TextElement>) {
+        let Some((x, font_size)) = self.history_panel() else {
+            return;
+        };
+        if self.history.is_empty() {
+            return;
+        }
+        let (_, oy) = self.ui.board_offset();
+        let total = self.history.len();
+        let mut ply = total.saturating_sub(30);
+
+        // Number from the full history so a truncated window still shows the
+        // real move numbers.
+        let mut rows: Vec<String> = Vec::new();
+        if ply % 2 == 1 {
+            rows.push(format!("{}. ... {}", ply / 2 + 1, self.history[ply]));
+            ply += 1;
+        }
+        while ply + 1 < total {
+            rows.push(format!(
+                "{}. {} {}",
+                ply / 2 + 1,
+                self.history[ply],
+                self.history[ply + 1]
+            ));
+            ply += 2;
+        }
+        if ply < total {
+            rows.push(format!("{}. {}", ply / 2 + 1, self.history[ply]));
+        }
+
+        for (row, line) in rows.into_iter().enumerate() {
+            texts.push(renderer::TextElement {
+                text: line,
+                x,
+                y: oy + font_size * (1.0 + row as f32 * 1.45),
+                size: font_size,
+                color: [0.82, 0.82, 0.82, 1.0],
+                align: renderer::TextAlign::Left,
                 shadow: false,
             });
         }
@@ -467,69 +759,6 @@ impl App {
         }
     }
 
-    fn push_player_info(&self, texts: &mut Vec<renderer::TextElement>) {
-        let info = match &self.live_info {
-            Some(i) => i,
-            None => return,
-        };
-
-        let sq = self.ui.square_size();
-        let board_px = sq * 8.0;
-        let (ox, oy) = self.ui.board_offset();
-        let left = ox;
-        let right = ox + board_px;
-        let font_size = (sq * 0.35).max(14.0);
-        let white = [1.0, 1.0, 1.0, 1.0];
-
-        // Freeze the clocks once the game is over so they don't drain forever.
-        let elapsed = if info.game_over {
-            0.0
-        } else {
-            info.last_update.elapsed().as_secs_f64()
-        };
-        let white_clock = if info.side_to_move == Color::White {
-            (info.white_clock - elapsed).max(0.0)
-        } else {
-            info.white_clock
-        };
-        let black_clock = if info.side_to_move == Color::Black {
-            (info.black_clock - elapsed).max(0.0)
-        } else {
-            info.black_clock
-        };
-
-        // Black bar (above the board)
-        let top_y = oy - font_size * 0.4;
-        texts.push(renderer::TextElement {
-            text: format!("{} ({})", info.black_name, info.black_rating),
-            x: left, y: top_y, size: font_size, color: white,
-            align: renderer::TextAlign::Left,
-            shadow: false,
-        });
-        texts.push(renderer::TextElement {
-            text: format_clock(black_clock),
-            x: right, y: top_y, size: font_size, color: white,
-            align: renderer::TextAlign::Right,
-            shadow: false,
-        });
-
-        // White bar (below the board)
-        let bottom_y = oy + board_px + font_size * 1.1;
-        texts.push(renderer::TextElement {
-            text: format!("{} ({})", info.white_name, info.white_rating),
-            x: left, y: bottom_y, size: font_size, color: white,
-            align: renderer::TextAlign::Left,
-            shadow: false,
-        });
-        texts.push(renderer::TextElement {
-            text: format_clock(white_clock),
-            x: right, y: bottom_y, size: font_size, color: white,
-            align: renderer::TextAlign::Right,
-            shadow: false,
-        });
-    }
-
-    /// Play a completed promotion and return to normal play.
     /// Which board clicks operate on: the local one in local play, the
     /// online one while a Board API game is running.
     fn active_board(&mut self) -> Option<&mut VariantPosition> {
@@ -586,14 +815,53 @@ impl App {
     }
 
     /// Apply a complete move to the active board: bookkeeping for local play,
-    /// and a background POST for online play.
+    /// and a background POST for online play. Either way, the from/to squares
+    /// become the last-move highlight (castling maps to the king's destination).
     fn apply_move(&mut self, mv: Move) {
+        let (last, san) = match self.active_board_ref() {
+            Some(pos) => (
+                mv.from().map(|from| (from, move_destination(mv, pos))),
+                Some(San::from_move(pos, mv).to_string()),
+            ),
+            None => (None, None),
+        };
         if self.mode == Mode::Local {
             self.board.play_unchecked(mv);
             self.side = self.board.turn();
             self.refresh_check_highlight();
         } else {
             self.post_online_move(mv);
+        }
+        if let Some(san) = san {
+            self.history.push(san);
+        }
+        self.ui.set_last_move(last);
+    }
+
+    /// The board the display is showing, without mutating it.
+    fn active_board_ref(&self) -> Option<&VariantPosition> {
+        match self.mode {
+            Mode::Local => Some(&self.board),
+            Mode::Play => self.online_game().map(|game| &game.board),
+            Mode::Live => None,
+        }
+    }
+
+    /// A new TV position arrived: derive the single move that produced it from
+    /// the previously displayed position and highlight it. When nothing matches
+    /// (a missed move, a new game), the highlight is cleared instead of wrong.
+    fn note_live_move(&mut self, board: &VariantPosition) {
+        match self
+            .live_board
+            .as_ref()
+            .and_then(|prev| derive_played_move(prev, board).map(|mv| (mv, prev)))
+        {
+            Some((mv, prev)) => {
+                self.history.push(San::from_move(prev, mv).to_string());
+                self.ui
+                    .set_last_move(mv.from().map(|from| (from, move_destination(mv, prev))));
+            }
+            None => self.ui.set_last_move(None),
         }
     }
 
@@ -781,6 +1049,9 @@ impl ApplicationHandler<NetEvent> for App {
                 if let Some(board) = board {
                     self.live_board = Some(board);
                 }
+                // A new featured game starts with no previous move.
+                self.ui.set_last_move(None);
+                self.history.clear();
                 self.live_info = Some(LiveGameInfo {
                     white_name,
                     black_name,
@@ -806,6 +1077,9 @@ impl ApplicationHandler<NetEvent> for App {
                 // (exploded king, king in the centre, lost horde, check count).
                 let terminal =
                     board.outcome().is_known() || board.is_variant_end() || board.halfmoves() >= 100;
+                // Derive the played move from the previously displayed board
+                // before overwriting it.
+                self.note_live_move(&board);
                 self.live_board = Some(board);
                 if let Some(info) = &mut self.live_info {
                     info.white_clock = white_secs as f64;
@@ -845,6 +1119,9 @@ impl ApplicationHandler<NetEvent> for App {
                     fen => position_from_fen("standard", fen).unwrap_or_default(),
                 };
                 replay_uci(&mut board, &moves);
+                // A fresh online game starts without a last-move highlight.
+                self.ui.set_last_move(None);
+                self.history.clear();
                 self.online = Online::Active(Box::new(OnlineGame {
                     game_id,
                     board,
@@ -861,13 +1138,24 @@ impl ApplicationHandler<NetEvent> for App {
                 }));
             }
             NetEvent::OnlineState { moves, wtime_ms, btime_ms, status, winner } => {
+                let mut advanced = None;
                 if let Online::Active(game) = &mut self.online {
+                    // The server echoes the whole move list; only the unseen
+                    // tail advances the board. Compare before/after and derive
+                    // the move rather than guessing.
+                    let prev = game.board.clone();
                     replay_uci(&mut game.board, &moves);
+                    if prev.board() != game.board.board() {
+                        advanced = Some(derive_last_move(&prev, &game.board));
+                    }
                     game.white_clock = wtime_ms as f64 / 1000.0;
                     game.black_clock = btime_ms as f64 / 1000.0;
                     game.last_update = Instant::now();
                     game.game_over = status != "started";
                     game.winner = winner;
+                }
+                if let Some(last) = advanced {
+                    self.ui.set_last_move(last);
                 }
             }
             NetEvent::OnlineFailed { message } => {
@@ -946,17 +1234,23 @@ impl ApplicationHandler<NetEvent> for App {
                         self.ui.clear_selection();
                         self.ui.clear_promotion();
                         self.ui.set_checked_king(None);
+                        self.ui.set_last_move(None);
+                        self.history.clear();
                         needs_redraw = true;
                     }
                     KeyCode::KeyP => {
                         self.mode = Mode::Local;
                         self.refresh_check_highlight();
+                        self.ui.set_last_move(None);
+                        self.history.clear();
                         needs_redraw = true;
                     }
                     KeyCode::KeyC => {
                         self.mode = Mode::Play;
                         self.ui.clear_selection();
                         self.ui.clear_promotion();
+                        self.ui.set_last_move(None);
+                        self.history.clear();
                         self.online_error = None;
                         self.start_online_challenge();
                         needs_redraw = true;
@@ -978,7 +1272,7 @@ impl ApplicationHandler<NetEvent> for App {
                 for r in self.ui.promotion_quads(cursor) {
                     quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
                 }
-                let pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
+                let mut pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
                     renderer::PieceElement {
                         role: c.role,
                         color: c.color,
@@ -987,6 +1281,11 @@ impl ApplicationHandler<NetEvent> for App {
                         size: c.rect.h,
                     }
                 }).collect();
+                // Captured trays live in the player bars (Live/Play only); they
+                // are ordinary extra pieces, no new pipeline.
+                if let Some(rend) = self.renderer.as_ref() {
+                    self.push_captured_icons(rend, &mut pieces);
+                }
                 let banner: Option<String> = match self.mode {
                     Mode::Local => App::game_banner(&self.board),
                     Mode::Live => {
@@ -1299,6 +1598,7 @@ fn main() {
         my_username: None,
         online: Online::Idle,
         online_error: None,
+        history: Vec::new(),
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -1325,6 +1625,7 @@ mod tests {
             my_username: None,
             online: Online::Idle,
             online_error: None,
+            history: Vec::new(),
         };
         app.ui.layout(800.0, 600.0);
         app
@@ -1879,5 +2180,264 @@ mod tests {
 
         let white = text_named(&texts, "White (1500)");
         assert!(white.y >= board_bottom, "player info overlaps the board");
+    }
+
+    /// Play a UCI move on a position (test helper).
+    fn play_uci(pos: &mut VariantPosition, uci: &str) {
+        let mv = UciMove::from_ascii(uci.as_bytes())
+            .expect("valid uci")
+            .to_move(pos)
+            .expect("legal move");
+        pos.play_unchecked(mv);
+    }
+
+    #[test]
+    fn last_move_derivation_handles_every_move_kind() {
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+        // Normal push.
+        let prev = position_from_fen("standard", start).expect("start fen");
+        let mut next = prev.clone();
+        play_uci(&mut next, "e2e4");
+        assert_eq!(derive_last_move(&prev, &next), Some((Square::E2, Square::E4)));
+
+        // Capture.
+        let prev = position_from_fen(
+            "standard",
+            "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+        )
+        .expect("capture fen");
+        let mut next = prev.clone();
+        play_uci(&mut next, "e4d5");
+        assert_eq!(derive_last_move(&prev, &next), Some((Square::E4, Square::D5)));
+
+        // Castling maps to the king's destination, not the rook's.
+        let prev =
+            position_from_fen("standard", "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").expect("castle fen");
+        let mut next = prev.clone();
+        play_uci(&mut next, "e1g1");
+        assert_eq!(derive_last_move(&prev, &next), Some((Square::E1, Square::G1)));
+
+        // En passant.
+        let prev = position_from_fen("standard", "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1")
+            .expect("en passant fen");
+        let mut next = prev.clone();
+        play_uci(&mut next, "e5d6");
+        assert_eq!(derive_last_move(&prev, &next), Some((Square::E5, Square::D6)));
+
+        // Promotion.
+        let prev =
+            position_from_fen("standard", "8/4P3/8/8/8/8/8/4K2k w - - 0 1").expect("promotion fen");
+        let mut next = prev.clone();
+        play_uci(&mut next, "e7e8q");
+        assert_eq!(derive_last_move(&prev, &next), Some((Square::E7, Square::E8)));
+    }
+
+    #[test]
+    fn tv_positions_highlight_the_derived_move_and_clear_on_a_gap() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Live;
+        let start = VariantPosition::default();
+        app.live_board = Some(start.clone());
+
+        // One legal move away: the highlight is exact.
+        let mut after_e4 = start;
+        play_uci(&mut after_e4, "e2e4");
+        app.note_live_move(&after_e4);
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+        assert_eq!(app.history, vec!["e4"]);
+        app.live_board = Some(after_e4.clone());
+
+        // Three plies arrived between events: nothing matches, so no tint
+        // rather than a wrong one.
+        let mut far = after_e4;
+        play_uci(&mut far, "e7e5");
+        play_uci(&mut far, "g1f3");
+        app.note_live_move(&far);
+        assert_eq!(app.ui.last_move(), None);
+        // The un-derived moves are not invented in the history either.
+        assert_eq!(app.history, vec!["e4"]);
+    }
+
+    #[test]
+    fn locally_played_moves_become_the_last_move_highlight() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let (x, y) = square_center(&app, Square::E2);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::E4);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+
+        // Castling highlights the king's origin and destination.
+        let mut app = app_from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1");
+        let (x, y) = square_center(&app, Square::E1);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::G1);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.last_move(), Some((Square::E1, Square::G1)));
+
+        // Promoting records the pawn move onto the last rank.
+        let mut app = app_with_promoting_pawn();
+        let (x, y) = square_center(&app, Square::E7);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::E8);
+        app.handle_board_click(x, y);
+        let (x, y) = choice_center(&app, Role::Queen);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.last_move(), Some((Square::E7, Square::E8)));
+    }
+
+    #[test]
+    fn captured_material_is_a_stateless_count_diff() {
+        // White lost a rook on a1, Black lost a knight on g8: Black leads by 2.
+        let board = position_from_fen(
+            "standard",
+            "rnbqkb1r/pppppppp/8/8/8/8/PPPPPPPP/1NBQKBNR w - - 0 1",
+        )
+        .expect("capture fen");
+        let caps = Captures::of(&board);
+        assert_eq!(caps.by_white, vec![Role::Knight]);
+        assert_eq!(caps.by_black, vec![Role::Rook]);
+        assert_eq!(caps.advantage, -2);
+
+        // An untouched starting board has empty trays and level material.
+        let start = VariantPosition::default();
+        let caps = Captures::of(&start);
+        assert!(caps.by_white.is_empty());
+        assert!(caps.by_black.is_empty());
+        assert_eq!(caps.advantage, 0);
+    }
+
+    #[test]
+    fn leading_side_shows_material_next_to_its_clock() {
+        let mut app = app_with_live_game();
+        // Black's queen and h8 rook are gone: White leads by 14.
+        app.live_board = Some(
+            position_from_fen(
+                "standard",
+                "rnb1kbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1",
+            )
+            .expect("capture fen"),
+        );
+        // Black to move keeps White's clock frozen at its server value, so the
+        // displayed text is deterministic.
+        app.live_info.as_mut().expect("live info").side_to_move = Color::Black;
+
+        let bars = app.player_bars().expect("live bars");
+        // Black leads nothing; no "+N" appended to its ticking clock.
+        assert!(!bars[0].clock.contains('+'));
+        assert!(bars[0].captured.is_empty());
+        // White's frozen clock shows the lead.
+        assert_eq!(bars[1].clock, "05:00 +14");
+        assert_eq!(bars[1].captured, vec![Role::Rook, Role::Queen]);
+
+        // The texts include the decorated clock.
+        let texts = app.build_texts();
+        assert!(texts.iter().any(|t| t.text == "05:00 +14"));
+    }
+
+    #[test]
+    fn play_bars_carry_captures_and_advantage() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.online = Online::Active(Box::new(OnlineGame {
+            game_id: "test".to_string(),
+            board: position_from_fen(
+                "standard",
+                "rnb1kbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1",
+            )
+            .expect("capture fen"),
+            my_color: Color::White,
+            white_name: "me".to_string(),
+            black_name: "them".to_string(),
+            white_rating: 1500,
+            black_rating: 1600,
+            white_clock: 300.0,
+            black_clock: 300.0,
+            last_update: Instant::now(),
+            game_over: true,
+            winner: None,
+        }));
+
+        let bars = app.player_bars().expect("play bars");
+        assert_eq!(bars[0].label, "them (1600)");
+        assert_eq!(bars[1].label, "me (1500) *");
+        assert_eq!(bars[1].clock, "05:00 +14");
+        assert!(bars[0].captured.is_empty());
+        assert_eq!(bars[1].captured, vec![Role::Rook, Role::Queen]);
+    }
+
+    #[test]
+    fn local_play_has_no_player_bars() {
+        let app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        assert_eq!(app.mode, Mode::Local);
+        assert!(app.player_bars().is_none());
+    }
+
+    #[test]
+    fn san_history_follows_local_play() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        for sq in [
+            Square::E2,
+            Square::E4,
+            Square::E7,
+            Square::E5,
+            Square::G1,
+            Square::F3,
+        ] {
+            let (x, y) = square_center(&app, sq);
+            app.handle_board_click(x, y);
+        }
+        assert_eq!(app.history, vec!["e4", "e5", "Nf3"]);
+    }
+
+    #[test]
+    fn move_history_panel_needs_spare_width() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        // 800x600 leaves only 160 px each side of the board: no column.
+        assert!(app.history_panel().is_none());
+
+        // 1400x800 leaves 380 px: the column opens beside the board.
+        app.ui.layout(1400.0, 800.0);
+        let (x, font_size) = app.history_panel().expect("wide window shows history");
+        let board_right = app.ui.board_offset().0 + app.ui.square_size() * 8.0;
+        assert!(x > board_right);
+        assert!(font_size >= 12.0);
+
+        // Rows pair up plies: 1. e4 e5.
+        for sq in [Square::E2, Square::E4, Square::E7, Square::E5] {
+            let (px, py) = square_center(&app, sq);
+            app.handle_board_click(px, py);
+        }
+        let texts = app.build_texts();
+        assert!(texts.iter().any(|t| t.text == "1. e4 e5"));
+    }
+
+    #[test]
+    fn move_history_shows_only_the_latest_plies() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.ui.layout(1400.0, 800.0);
+        for i in 0..40 {
+            app.history.push(format!("m{i}"));
+        }
+        let texts = app.build_texts();
+        // 40 plies, keep the last 30: rows start at move 6.
+        assert!(texts.iter().any(|t| t.text == "6. m10 m11"));
+        assert!(texts.iter().any(|t| t.text == "20. m38 m39"));
+        assert!(!texts.iter().any(|t| t.text.starts_with("1. m0")));
+    }
+
+    #[test]
+    fn captured_tray_truncates_when_space_is_tight() {
+        // 9 icons of 20 px, 2 px apart, fit into 200 px.
+        assert_eq!(tray_fit(0.0, 200.0, 10, 20.0, 2.0), 9);
+        // A tight row keeps only the first two.
+        assert_eq!(tray_fit(10.0, 60.0, 10, 20.0, 2.0), 2);
+        // No room at all: nothing is drawn rather than colliding with the clock.
+        assert_eq!(tray_fit(100.0, 100.0, 3, 20.0, 2.0), 0);
+        assert_eq!(tray_fit(150.0, 100.0, 3, 20.0, 2.0), 0);
+        // Fewer pieces than the row can hold: all of them.
+        assert_eq!(tray_fit(0.0, 200.0, 2, 20.0, 2.0), 2);
     }
 }

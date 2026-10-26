@@ -115,6 +115,12 @@ impl Renderer {
         }
     }
 
+    /// Width in pixels of `text` at `size`, using the same glyph advances as
+    /// rendering. Clients use this to keep extra UI rows clear of text.
+    pub fn text_width(&self, text: &str, size: f32) -> f32 {
+        self.text_pipeline.text_width(text, size)
+    }
+
     pub fn render(&mut self, scene: &Scene) {
         if self.config.width == 0 || self.config.height == 0 {
             return;

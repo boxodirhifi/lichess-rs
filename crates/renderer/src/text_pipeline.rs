@@ -349,6 +349,12 @@ impl TextPipeline {
         w
     }
 
+    /// Advance width of `text` in pixels at a nominal `size`, exactly as
+    /// rendering would lay it out.
+    pub fn text_width(&self, text: &str, size: f32) -> f32 {
+        self.measure_text(text, size / RASTER_HEIGHT)
+    }
+
     // One entry point that uploads the whole text scene to the GPU.
     pub fn prepare(
         &mut self,

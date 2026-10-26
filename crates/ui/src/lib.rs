@@ -14,6 +14,8 @@ const LIGHT: [f32; 3] = [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0];
 const DARK: [f32; 3] = [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0];
 const SELECTED: [f32; 3] = [106.0 / 255.0, 170.0 / 255.0, 100.0 / 255.0];
 const TARGET: [f32; 3] = [0.30, 0.55, 0.85];
+/// Muted yellow over both squares of the last played move (Lichess-style).
+const LAST_MOVE: [f32; 3] = [205.0 / 255.0, 178.0 / 255.0, 80.0 / 255.0];
 const CHECK: [f32; 3] = [0.85, 0.25, 0.25];
 const PANEL: [f32; 3] = [0.24, 0.23, 0.22];
 const PANEL_CELL: [f32; 3] = [0.86, 0.82, 0.74];
@@ -32,6 +34,8 @@ pub struct UI {
     selected: Option<Square>,
     move_targets: Vec<Square>,
     checked_king: Option<Square>,
+    /// From/to squares of the last played move, tinted in both play and TV.
+    last_move: Option<(Square, Square)>,
     /// Square the piece being dragged came from, while the mouse is down.
     dragging: Option<Square>,
     drag_origin: Option<(f32, f32)>,
@@ -233,6 +237,11 @@ impl UI {
                 SELECTED
             } else if self.move_targets.contains(&sq) {
                 TARGET
+            } else if self
+                .last_move
+                .is_some_and(|(from, to)| from == sq || to == sq)
+            {
+                LAST_MOVE
             } else {
                 base
             };
@@ -274,6 +283,17 @@ impl UI {
     pub fn set_checked_king(&mut self, sq: Option<Square>) {
         self.checked_king = sq;
         self.apply_colors();
+    }
+
+    /// Mark the move that was just played; both squares get the muted-yellow
+    /// tint until the next move, a mode switch, or a new game clears it.
+    pub fn set_last_move(&mut self, mv: Option<(Square, Square)>) {
+        self.last_move = mv;
+        self.apply_colors();
+    }
+
+    pub fn last_move(&self) -> Option<(Square, Square)> {
+        self.last_move
     }
 
     pub fn selected_square(&self) -> Option<Square> {
@@ -526,5 +546,41 @@ mod tests {
         assert_eq!(ui.dragging_piece(&board), None);
         // Ending a drag never touches the selection; the client decides.
         assert_eq!(ui.selected_square(), Some(Square::E2));
+    }
+
+    fn square_color(ui: &UI, sq: Square) -> [f32; 3] {
+        let idx = (7 - sq.rank().to_u32() as usize) * 8 + sq.file().to_u32() as usize;
+        ui.squares[idx].color
+    }
+
+    #[test]
+    fn last_move_tints_both_squares_under_the_other_highlights() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        let (e2, e4) = (Square::E2, Square::E4);
+
+        ui.set_last_move(Some((e2, e4)));
+        assert_eq!(square_color(&ui, e2), LAST_MOVE);
+        assert_eq!(square_color(&ui, e4), LAST_MOVE);
+        // Untouched squares keep their base colour.
+        assert_eq!(square_color(&ui, Square::A1), DARK);
+        assert_eq!(square_color(&ui, Square::B1), LIGHT);
+
+        // Selection and targets win over the last-move tint...
+        ui.select(e2, vec![e4]);
+        assert_eq!(square_color(&ui, e2), SELECTED);
+        assert_eq!(square_color(&ui, e4), TARGET);
+        // ...and so does a king in check.
+        ui.set_checked_king(Some(e2));
+        assert_eq!(square_color(&ui, e2), CHECK);
+
+        // Clearing the higher-priority states uncovers the last-move tint.
+        ui.set_checked_king(None);
+        ui.clear_selection();
+        assert_eq!(square_color(&ui, e2), LAST_MOVE);
+        assert_eq!(square_color(&ui, e4), LAST_MOVE);
+
+        ui.set_last_move(None);
+        assert_eq!(square_color(&ui, e2), LIGHT);
+        assert_eq!(square_color(&ui, e4), LIGHT);
     }
 }
