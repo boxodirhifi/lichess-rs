@@ -7,7 +7,7 @@ use shakmaty::{Color, Position, Role};
 use wgpu::util::DeviceExt;
 
 use crate::quad_pipeline::CameraUniforms;
-use crate::PieceElement;
+use crate::{DragSource, PieceElement};
 
 /// Raster size of one piece cell in the atlas; sharp enough for HiDPI.
 const PIECE_RASTER: u32 = 256;
@@ -21,6 +21,9 @@ const MAX_QUADS: u32 = 4096;
 struct PieceVertex {
     position: [f32; 2],
     uv: [f32; 2],
+    /// Straight-alpha multiplier for the sampled piece (pocket pieces that
+    /// can't be dropped are dimmed).
+    alpha: f32,
 }
 
 /// Atlas slot of a piece: white roles first, then black.
@@ -275,6 +278,7 @@ impl PiecePipeline {
                     attributes: &[
                         wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
                         wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
+                        wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32 },
                     ],
                 }],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -365,13 +369,17 @@ impl PiecePipeline {
         offset_y: f32,
         sq: f32,
         pieces: &[PieceElement],
-        dragged: Option<(shakmaty::Square, PieceElement)>,
+        dragged: Option<(DragSource, PieceElement)>,
     ) {
         self.vertices.clear();
 
         // The dragged piece's origin square is skipped, so the piece exists
-        // only under the cursor while it is being moved.
-        let origin = dragged.map(|(from, _)| from);
+        // only under the cursor while it is being moved. Pocket drags have no
+        // board square to hide.
+        let origin = match dragged {
+            Some((DragSource::Board(square), _)) => Some(square),
+            _ => None,
+        };
         if sq > 0.0 {
             for square in shakmaty::Square::ALL {
                 if origin == Some(square) {
@@ -385,18 +393,18 @@ impl PiecePipeline {
                 let rank = (idx / 8) as f32;
                 let cx = offset_x + file * sq + sq * 0.5;
                 let cy = offset_y + (7.0 - rank) * sq + sq * 0.5;
-                self.push_piece(piece.role, piece.color, cx, cy, sq);
+                self.push_piece(piece.role, piece.color, cx, cy, sq, 1.0);
             }
         }
 
         for p in pieces {
-            self.push_piece(p.role, p.color, p.x, p.y, p.size);
+            self.push_piece(p.role, p.color, p.x, p.y, p.size, p.alpha);
         }
 
         // Last, so the dragged piece is on top of every other piece (only the
         // text pass, i.e. the game-over banner, draws after this pipeline).
         if let Some((_, p)) = dragged {
-            self.push_piece(p.role, p.color, p.x, p.y, p.size);
+            self.push_piece(p.role, p.color, p.x, p.y, p.size, p.alpha);
         }
 
         self.draw_count = (self.vertices.len() / 4) as u32;
@@ -407,7 +415,7 @@ impl PiecePipeline {
 
     /// A piece occupies its full square, centred; the SVG's own padding
     /// keeps it visually balanced, like Lichess's own board.
-    fn push_piece(&mut self, role: Role, color: Color, cx: f32, cy: f32, size: f32) {
+    fn push_piece(&mut self, role: Role, color: Color, cx: f32, cy: f32, size: f32, alpha: f32) {
         let idx = piece_index(role, color);
         // Half-texel inset on every cell edge keeps linear filtering from
         // bleeding into the neighbouring atlas cell.
@@ -423,10 +431,10 @@ impl PiecePipeline {
 
         let x0 = cx - size * 0.5;
         let y0 = cy - size * 0.5;
-        self.vertices.push(PieceVertex { position: [x0, y0], uv: [u0, v0] });
-        self.vertices.push(PieceVertex { position: [x0 + size, y0], uv: [u1, v0] });
-        self.vertices.push(PieceVertex { position: [x0 + size, y0 + size], uv: [u1, v1] });
-        self.vertices.push(PieceVertex { position: [x0, y0 + size], uv: [u0, v1] });
+        self.vertices.push(PieceVertex { position: [x0, y0], uv: [u0, v0], alpha });
+        self.vertices.push(PieceVertex { position: [x0 + size, y0], uv: [u1, v0], alpha });
+        self.vertices.push(PieceVertex { position: [x0 + size, y0 + size], uv: [u1, v1], alpha });
+        self.vertices.push(PieceVertex { position: [x0, y0 + size], uv: [u0, v1], alpha });
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {

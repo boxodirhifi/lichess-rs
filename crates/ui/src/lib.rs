@@ -28,16 +28,58 @@ pub struct PromotionChoice {
     pub color: Color,
 }
 
+/// One grouped Crazyhouse pocket entry. Crazyhouse pockets hold at most one
+/// entry per role; the count rides in a small badge beside the icon.
+#[derive(Debug, Clone, Copy)]
+pub struct PocketPiece {
+    /// Icon rectangle; the piece fills it.
+    pub rect: Rect,
+    pub role: Role,
+    pub color: Color,
+    pub count: u8,
+    /// Whether this side may drop right now (side to move / our colour).
+    pub interactive: bool,
+}
+
+impl PocketPiece {
+    /// Pocket pieces that cannot be used are dimmed to signal that they are
+    /// display-only.
+    pub fn alpha(&self) -> f32 {
+        if self.interactive {
+            1.0
+        } else {
+            0.5
+        }
+    }
+
+    /// `x2` style badge text, only when the role appears more than once.
+    pub fn badge(&self) -> Option<String> {
+        (self.count > 1).then(|| format!("x{}", self.count))
+    }
+}
+
 #[derive(Default)]
 pub struct UI {
     pub squares: Vec<Rect>,
     selected: Option<Square>,
     move_targets: Vec<Square>,
+    /// Pocket piece picked for a drop; mutually exclusive with `selected`.
+    selected_pocket_piece: Option<Role>,
+    /// Grouped pocket pieces per colour, in tray order. Empty outside
+    /// Crazyhouse, which is how the pocket UI stays variant-only.
+    pocket_black: Vec<PocketPiece>,
+    pocket_white: Vec<PocketPiece>,
+    /// The row ran out of room and was cut short (rendered with an ellipsis).
+    pocket_truncated: [bool; 2],
+    /// X position just past the last pocket element, per colour.
+    pocket_end: [f32; 2],
     checked_king: Option<Square>,
     /// From/to squares of the last played move, tinted in both play and TV.
     last_move: Option<(Square, Square)>,
     /// Square the piece being dragged came from, while the mouse is down.
     dragging: Option<Square>,
+    /// Role being dragged out of a pocket; mutually exclusive with `dragging`.
+    dragging_pocket: Option<Role>,
     drag_origin: Option<(f32, f32)>,
     /// Whether the cursor has left the click slop since `start_drag`; a press
     /// and release without movement stays a plain click.
@@ -271,13 +313,166 @@ impl UI {
     pub fn select(&mut self, sq: Square, targets: Vec<Square>) {
         self.selected = Some(sq);
         self.move_targets = targets;
+        self.selected_pocket_piece = None;
+        self.apply_colors();
+    }
+
+    /// Pick a pocket role for a drop. Selecting a pocket piece always clears
+    /// the board selection, and vice versa.
+    pub fn select_pocket(&mut self, role: Role, targets: Vec<Square>) {
+        self.selected = None;
+        self.move_targets = targets;
+        self.selected_pocket_piece = Some(role);
         self.apply_colors();
     }
 
     pub fn clear_selection(&mut self) {
         self.selected = None;
         self.move_targets.clear();
+        self.selected_pocket_piece = None;
         self.apply_colors();
+    }
+
+    pub fn selected_pocket_piece(&self) -> Option<Role> {
+        self.selected_pocket_piece
+    }
+
+    /// Replace one colour's pocket row. `items` is grouped by role (pawns
+    /// first); an empty list hides the row. Pocket rows sit on their own line
+    /// outside the player bar, so names, clocks and the history column never
+    /// collide with them.
+    pub fn set_pocket(&mut self, color: Color, items: &[(Role, u8)], interactive: bool) {
+        let sq = self.sq_size;
+        let idx = match color {
+            Color::Black => 0,
+            Color::White => 1,
+        };
+        self.pocket_truncated[idx] = false;
+
+        if sq <= 0.0 {
+            self.pocket_end[idx] = self.offset_x;
+            self.replace_pocket(color, Vec::new());
+            return;
+        }
+
+        let icon = sq * 0.45;
+        let gap = sq * 0.05;
+        let badge_slot = icon * 0.8;
+        let font_size = (sq * 0.35).max(14.0);
+        // Above the top bar and below the bottom bar; both rows start at the
+        // board's left edge.
+        let cy = match color {
+            Color::Black => self.offset_y - font_size * 1.1 - gap - icon * 0.5,
+            Color::White => {
+                self.offset_y + self.board_px + font_size * 1.3 + gap + icon * 0.5
+            }
+        };
+        let limit = self.offset_x + self.board_px - sq * 0.05;
+
+        let mut pieces = Vec::with_capacity(items.len());
+        let mut x = self.offset_x;
+        for &(role, count) in items {
+            if count == 0 {
+                continue;
+            }
+            if x + icon > limit {
+                self.pocket_truncated[idx] = true;
+                break;
+            }
+            pieces.push(PocketPiece {
+                rect: Rect {
+                    x,
+                    y: cy - icon * 0.5,
+                    w: icon,
+                    h: icon,
+                    color: PANEL_CELL,
+                },
+                role,
+                color,
+                count,
+                interactive,
+            });
+            x += icon + gap;
+            if count > 1 {
+                x += badge_slot;
+            }
+        }
+        let empty = pieces.is_empty();
+        let end = if empty {
+            self.offset_x
+        } else if self.pocket_truncated[idx] {
+            x
+        } else {
+            x - gap
+        };
+        self.replace_pocket(color, pieces);
+        self.pocket_end[idx] = end;
+    }
+
+    fn replace_pocket(&mut self, color: Color, pieces: Vec<PocketPiece>) {
+        match color {
+            Color::Black => self.pocket_black = pieces,
+            Color::White => self.pocket_white = pieces,
+        }
+    }
+
+    pub fn pockets(&self, color: Color) -> &[PocketPiece] {
+        match color {
+            Color::Black => &self.pocket_black,
+            Color::White => &self.pocket_white,
+        }
+    }
+
+    pub fn pocket_truncated(&self, color: Color) -> bool {
+        self.pocket_truncated[match color {
+            Color::Black => 0,
+            Color::White => 1,
+        }]
+    }
+
+    /// X just past the last pocket element; the client puts an ellipsis here
+    /// when the row was truncated.
+    pub fn pocket_end(&self, color: Color) -> f32 {
+        self.pocket_end[match color {
+            Color::Black => 0,
+            Color::White => 1,
+        }]
+    }
+
+    /// Hit-test the interactive pocket pieces only: the opponent's pocket is
+    /// display-only everywhere, and the non-moving side is inert in local play.
+    pub fn pocket_at(&self, x: f32, y: f32) -> Option<(Color, Role)> {
+        for color in [Color::Black, Color::White] {
+            if let Some(p) = self
+                .pockets(color)
+                .iter()
+                .find(|p| p.interactive && contains(&p.rect, x, y))
+            {
+                return Some((color, p.role));
+            }
+        }
+        None
+    }
+
+    /// Background quads behind the selected pocket piece (drawn under the
+    /// piece icons, like the promotion menu's hover tint).
+    pub fn pocket_quads(&self) -> Vec<Rect> {
+        let Some(role) = self.selected_pocket_piece else {
+            return Vec::new();
+        };
+        let pad = self.sq_size * 0.06;
+        self.pocket_black
+            .iter()
+            .chain(self.pocket_white.iter())
+            .filter(|p| p.interactive && p.role == role)
+            .map(|p| Rect {
+                x: p.rect.x - pad,
+                y: p.rect.y - pad,
+                w: p.rect.w + pad * 2.0,
+                h: p.rect.h + pad * 2.0,
+                color: SELECTED,
+            })
+            .collect()
     }
 
     pub fn set_checked_king(&mut self, sq: Option<Square>) {
@@ -308,6 +503,15 @@ impl UI {
     /// position, used as the click-vs-drag origin.
     pub fn start_drag(&mut self, sq: Square, x: f32, y: f32) {
         self.dragging = Some(sq);
+        self.dragging_pocket = None;
+        self.drag_origin = Some((x, y));
+        self.drag_moved = false;
+    }
+
+    /// Begin dragging a pocket piece; mutually exclusive with a board drag.
+    pub fn start_pocket_drag(&mut self, role: Role, x: f32, y: f32) {
+        self.dragging = None;
+        self.dragging_pocket = Some(role);
         self.drag_origin = Some((x, y));
         self.drag_moved = false;
     }
@@ -315,7 +519,7 @@ impl UI {
     /// Follow the cursor. Returns true once the cursor has moved beyond the
     /// click slop, i.e. this is a real drag rather than a click.
     pub fn drag_to(&mut self, x: f32, y: f32) -> bool {
-        if let (Some((ox, oy)), Some(_)) = (self.drag_origin, self.dragging) {
+        if let (Some((ox, oy)), true) = (self.drag_origin, self.is_dragging()) {
             let slop = (self.sq_size * 0.12).max(3.0);
             if (x - ox).abs() > slop || (y - oy).abs() > slop {
                 self.drag_moved = true;
@@ -327,12 +531,14 @@ impl UI {
     /// Finish a drag, whether it played a move or was cancelled.
     pub fn end_drag(&mut self) {
         self.dragging = None;
+        self.dragging_pocket = None;
         self.drag_origin = None;
         self.drag_moved = false;
     }
 
+    /// True while either a board piece or a pocket piece is under the mouse.
     pub fn is_dragging(&self) -> bool {
-        self.dragging.is_some()
+        self.dragging.is_some() || self.dragging_pocket.is_some()
     }
 
     /// True once the press has turned into an actual drag; the renderer only
@@ -343,6 +549,10 @@ impl UI {
 
     pub fn dragging_square(&self) -> Option<Square> {
         self.dragging
+    }
+
+    pub fn dragging_pocket_piece(&self) -> Option<Role> {
+        self.dragging_pocket
     }
 
     /// The piece under drag, looked up on the board being displayed.
@@ -582,5 +792,124 @@ mod tests {
         ui.set_last_move(None);
         assert_eq!(square_color(&ui, e2), LIGHT);
         assert_eq!(square_color(&ui, e4), LIGHT);
+    }
+
+    #[test]
+    fn pocket_rows_group_badges_and_hit_test_only_when_usable() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        assert!(ui.pockets(Color::White).is_empty(), "no pockets by default");
+
+        ui.set_pocket(Color::White, &[(Role::Pawn, 3), (Role::Knight, 1)], true);
+        let pieces = ui.pockets(Color::White).to_vec();
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].role, Role::Pawn);
+        assert_eq!(pieces[0].count, 3);
+        assert_eq!(pieces[0].badge().as_deref(), Some("x3"));
+        assert_eq!(pieces[1].badge(), None);
+        assert_eq!(pieces[0].color, Color::White);
+        assert_eq!(pieces[0].alpha(), 1.0);
+
+        // Grouped entries share one row, starting at the board's left edge.
+        let (ox, oy) = ui.board_offset();
+        assert_eq!(pieces[0].rect.x, ox);
+        assert_eq!(pieces[0].rect.y, pieces[1].rect.y);
+        // White's row sits below the board, Black's above it.
+        let board_bottom = oy + ui.square_size() * 8.0;
+        assert!(pieces[0].rect.y >= board_bottom);
+        ui.set_pocket(Color::Black, &[(Role::Queen, 1)], false);
+        let black = ui.pockets(Color::Black)[0];
+        assert!(black.rect.y + black.rect.h <= oy);
+
+        // A display-only pocket is dimmed and inert; the usable one is solid
+        // and clickable.
+        assert_eq!(black.alpha(), 0.5);
+        assert_eq!(ui.pocket_at(black.rect.x + 1.0, black.rect.y + 1.0), None);
+        assert_eq!(
+            ui.pocket_at(pieces[0].rect.x + 1.0, pieces[0].rect.y + 1.0),
+            Some((Color::White, Role::Pawn))
+        );
+    }
+
+    #[test]
+    fn empty_pockets_render_nothing() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        ui.set_pocket(Color::White, &[], true);
+        assert!(ui.pockets(Color::White).is_empty());
+        assert!(!ui.pocket_truncated(Color::White));
+        assert_eq!(ui.pocket_end(Color::White), ui.board_offset().0);
+
+        ui.set_pocket(Color::White, &[(Role::Pawn, 2)], true);
+        assert_eq!(ui.pockets(Color::White).len(), 1);
+        ui.set_pocket(Color::White, &[], true);
+        assert!(
+            ui.pockets(Color::White).is_empty(),
+            "switching away from Crazyhouse clears the row"
+        );
+    }
+
+    #[test]
+    fn pocket_and_board_selection_are_mutually_exclusive() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        ui.set_pocket(Color::White, &[(Role::Knight, 1)], true);
+
+        ui.select(Square::E2, vec![Square::E4]);
+        ui.select_pocket(Role::Knight, vec![Square::D4, Square::F6]);
+        assert_eq!(ui.selected_square(), None, "pocket pick clears the board piece");
+        assert_eq!(ui.selected_pocket_piece(), Some(Role::Knight));
+        assert!(ui.is_move_target(Square::D4));
+        assert_eq!(square_color(&ui, Square::D4), TARGET);
+        assert!(!ui.pocket_quads().is_empty(), "the picked pocket piece is tinted");
+
+        ui.select(Square::G1, vec![Square::F3]);
+        assert_eq!(
+            ui.selected_pocket_piece(),
+            None,
+            "board pick clears the pocket"
+        );
+        assert_eq!(ui.selected_square(), Some(Square::G1));
+        assert!(ui.pocket_quads().is_empty());
+
+        ui.select_pocket(Role::Knight, vec![Square::D4]);
+        ui.clear_selection();
+        assert_eq!(ui.selected_square(), None);
+        assert_eq!(ui.selected_pocket_piece(), None);
+        assert!(!ui.is_move_target(Square::D4));
+    }
+
+    #[test]
+    fn pocket_drag_is_exclusive_with_a_board_drag() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        ui.set_pocket(Color::White, &[(Role::Pawn, 1)], true);
+        let pocket = ui.pockets(Color::White)[0];
+
+        ui.start_pocket_drag(pocket.role, pocket.rect.x, pocket.rect.y);
+        assert!(ui.is_dragging());
+        assert_eq!(ui.dragging_pocket_piece(), Some(Role::Pawn));
+        assert_eq!(ui.dragging_square(), None);
+        assert!(!ui.drag_to(pocket.rect.x + 1.0, pocket.rect.y + 1.0));
+        assert!(ui.drag_to(pocket.rect.x + 200.0, pocket.rect.y));
+
+        ui.start_drag(Square::E2, 0.0, 0.0);
+        assert_eq!(ui.dragging_pocket_piece(), None);
+        assert_eq!(ui.dragging_square(), Some(Square::E2));
+
+        ui.start_pocket_drag(Role::Pawn, 0.0, 0.0);
+        assert_eq!(ui.dragging_square(), None);
+        assert_eq!(ui.dragging_pocket_piece(), Some(Role::Pawn));
+
+        ui.end_drag();
+        assert!(!ui.is_dragging());
+    }
+
+    #[test]
+    fn a_too_wide_pocket_row_is_truncated_at_the_board_edge() {
+        let mut ui = ui_at(400.0, 300.0);
+        let items: Vec<(Role, u8)> = (0..20).map(|_| (Role::Queen, 2)).collect();
+        ui.set_pocket(Color::White, &items, true);
+
+        assert!(ui.pocket_truncated(Color::White));
+        assert!(ui.pockets(Color::White).len() < items.len());
+        let right = ui.board_offset().0 + ui.square_size() * 8.0;
+        assert!(ui.pocket_end(Color::White) <= right);
     }
 }

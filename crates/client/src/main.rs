@@ -333,6 +333,45 @@ fn tray_fit(start: f32, end: f32, count: usize, icon: f32, gap: f32) -> usize {
     fit
 }
 
+/// Grouped Crazyhouse pocket contents in tray order (pawns first), straight
+/// from shakmaty's authoritative pockets. Every other variant has no pockets,
+/// so the pocket UI simply stays empty there.
+fn pocket_items(pos: &VariantPosition, color: Color) -> Vec<(Role, u8)> {
+    let Some(pockets) = pos.pockets() else {
+        return Vec::new();
+    };
+    let by_role = pockets.get(color);
+    [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen]
+        .into_iter()
+        .filter_map(|role| {
+            let count = *by_role.get(role);
+            (count > 0).then_some((role, count))
+        })
+        .collect()
+}
+
+/// Empty squares where `role` may be dropped, taken from shakmaty's legal
+/// move list. Drop legality is never decided by the UI.
+fn drop_squares(pos: &VariantPosition, role: Role) -> Vec<Square> {
+    pos.legal_moves()
+        .into_iter()
+        .filter_map(|mv| match mv {
+            Move::Put { role: dropped, to } if dropped == role => Some(to),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The legal drop of `role` onto `to`, if one exists.
+fn find_drop(pos: &VariantPosition, role: Role, to: Square) -> Option<Move> {
+    pos.legal_moves().into_iter().find(|&mv| {
+        matches!(
+            mv,
+            Move::Put { role: dropped, to: square } if dropped == role && square == to
+        )
+    })
+}
+
 /// Clock text with the material lead appended for the leading side.
 fn clock_with_advantage(secs: f64, advantage: i32) -> String {
     if advantage > 0 {
@@ -447,6 +486,7 @@ impl App {
         let mut texts = Vec::new();
         self.push_coordinates(&mut texts);
         self.push_player_bars(&mut texts);
+        self.push_pocket_badges(&mut texts);
         self.push_move_history(&mut texts);
         texts
     }
@@ -621,10 +661,108 @@ impl App {
                     x: x + icon * 0.5,
                     y: bar.y - font_size * 0.33,
                     size: icon,
+                    alpha: 1.0,
                 });
                 x += icon + gap;
             }
         }
+    }
+
+    /// Pocket icons for both rows; usable pieces are solid, display-only ones
+    /// are dimmed. They use the same `Scene.pieces` path as the promotion menu.
+    fn push_pocket_icons(&self, out: &mut Vec<renderer::PieceElement>) {
+        for color in [Color::Black, Color::White] {
+            for p in self.ui.pockets(color) {
+                out.push(renderer::PieceElement {
+                    role: p.role,
+                    color: p.color,
+                    x: p.rect.x + p.rect.w * 0.5,
+                    y: p.rect.y + p.rect.h * 0.5,
+                    size: p.rect.w,
+                    alpha: p.alpha(),
+                });
+            }
+        }
+    }
+
+    /// `x2` count badges beside grouped pocket pieces, plus an ellipsis when a
+    /// row had to be truncated at the board edge.
+    fn push_pocket_badges(&self, texts: &mut Vec<renderer::TextElement>) {
+        let sq = self.ui.square_size();
+        if sq <= 0.0 {
+            return;
+        }
+        let size = (sq * 0.22).max(10.0);
+        for color in [Color::Black, Color::White] {
+            for p in self.ui.pockets(color) {
+                let Some(badge) = p.badge() else {
+                    continue;
+                };
+                texts.push(renderer::TextElement {
+                    text: badge,
+                    x: p.rect.x + p.rect.w + sq * 0.01,
+                    y: p.rect.y + p.rect.h * 0.5 + size * 0.35,
+                    size,
+                    color: [0.92, 0.92, 0.92, if p.interactive { 1.0 } else { 0.5 }],
+                    align: renderer::TextAlign::Left,
+                    shadow: false,
+                });
+            }
+            if self.ui.pocket_truncated(color) {
+                if let Some(last) = self.ui.pockets(color).last() {
+                    texts.push(renderer::TextElement {
+                        text: "\u{2026}".to_string(),
+                        x: self.ui.pocket_end(color),
+                        y: last.rect.y + last.rect.h * 0.5 + size * 0.35,
+                        size,
+                        color: [0.92, 0.92, 0.92, 1.0],
+                        align: renderer::TextAlign::Left,
+                        shadow: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Recompute the displayed pocket rows from the current position. Run
+    /// before layout/render and before hit-testing; it is a cheap, idempotent
+    /// derivation, never a second source of truth for pocket contents.
+    fn sync_pockets(&mut self) {
+        let (black, white, black_usable, white_usable) = {
+            let board = match self.mode {
+                Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
+                Mode::Local => &self.board,
+                Mode::Play => match self.online_game() {
+                    Some(game) => &game.board,
+                    None => &self.board,
+                },
+            };
+            let (black_usable, white_usable) = match self.mode {
+                Mode::Live => (false, false),
+                Mode::Local => {
+                    let live = !self.local_game_over();
+                    (
+                        live && board.turn() == Color::Black,
+                        live && board.turn() == Color::White,
+                    )
+                }
+                Mode::Play => match self.online_game() {
+                    Some(game) if !game.game_over && game.board.turn() == game.my_color => (
+                        game.my_color == Color::Black,
+                        game.my_color == Color::White,
+                    ),
+                    _ => (false, false),
+                },
+            };
+            (
+                pocket_items(board, Color::Black),
+                pocket_items(board, Color::White),
+                black_usable,
+                white_usable,
+            )
+        };
+        self.ui.set_pocket(Color::Black, &black, black_usable);
+        self.ui.set_pocket(Color::White, &white, white_usable);
     }
 
     /// Where the move-history column starts, and its font size, when the
@@ -869,6 +1007,9 @@ impl App {
         if self.mode == Mode::Live {
             return;
         }
+        // Pocket geometry follows the displayed board and whose turn it is.
+        self.sync_pockets();
+
         // A click while the promotion menu is open either picks a piece or
         // dismisses the menu and keeps the pawn selected.
         if self.ui.promotion_open() {
@@ -893,6 +1034,19 @@ impl App {
             Mode::Live => unreachable!(),
         };
 
+        // A usable pocket piece starts a drop selection: its legal drops come
+        // from shakmaty's move list and use the ordinary target tint.
+        if let Some((_, role)) = self.ui.pocket_at(x, y) {
+            if my_turn {
+                let targets = self
+                    .active_board_ref()
+                    .map(|board| drop_squares(board, role))
+                    .unwrap_or_default();
+                self.ui.select_pocket(role, targets);
+            }
+            return;
+        }
+
         let sq = match self.ui.square_at(x, y) {
             Some(sq) => sq,
             None => {
@@ -901,6 +1055,20 @@ impl App {
             }
         };
         if self.ui.is_move_target(sq) {
+            if let Some(role) = self.ui.selected_pocket_piece() {
+                // A drop: find the matching `Move::Put` and play it through
+                // the same path as board moves.
+                if my_turn {
+                    let mv = self
+                        .active_board_ref()
+                        .and_then(|board| find_drop(board, role, sq));
+                    if let Some(mv) = mv {
+                        self.apply_move(mv);
+                    }
+                }
+                self.ui.clear_selection();
+                return;
+            }
             if let Some(from) = self.ui.selected_square() {
                 let candidates = self
                     .active_board()
@@ -981,6 +1149,14 @@ impl App {
     fn handle_mouse_press(&mut self, x: f32, y: f32) {
         self.handle_board_click(x, y);
         if self.mode == Mode::Live {
+            return;
+        }
+        // Pressing a usable pocket piece arms a drop drag; the click above has
+        // already selected it and highlighted its legal landing squares.
+        if let Some((_, role)) = self.ui.pocket_at(x, y) {
+            if self.ui.selected_pocket_piece() == Some(role) {
+                self.ui.start_pocket_drag(role, x, y);
+            }
             return;
         }
         let Some(sq) = self.ui.square_at(x, y) else {
@@ -1240,6 +1416,7 @@ impl ApplicationHandler<NetEvent> for App {
                     }
                     KeyCode::KeyP => {
                         self.mode = Mode::Local;
+                        self.ui.clear_selection();
                         self.refresh_check_highlight();
                         self.ui.set_last_move(None);
                         self.history.clear();
@@ -1263,6 +1440,8 @@ impl ApplicationHandler<NetEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Derive the pocket rows before anything reads them for layout.
+                self.sync_pockets();
                 let texts = self.build_texts();
                 let cursor = Some((self.cursor_pos.0 as f32, self.cursor_pos.1 as f32));
                 let mut quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
@@ -1272,6 +1451,11 @@ impl ApplicationHandler<NetEvent> for App {
                 for r in self.ui.promotion_quads(cursor) {
                     quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
                 }
+                // Selection tint behind the chosen pocket piece; quads draw
+                // under the piece pass, so it reads as a highlight.
+                for r in self.ui.pocket_quads() {
+                    quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
+                }
                 let mut pieces: Vec<renderer::PieceElement> = self.ui.promotion_choices().iter().map(|c| {
                     renderer::PieceElement {
                         role: c.role,
@@ -1279,8 +1463,12 @@ impl ApplicationHandler<NetEvent> for App {
                         x: c.rect.x + c.rect.w * 0.5,
                         y: c.rect.y + c.rect.h * 0.5,
                         size: c.rect.h,
+                        alpha: 1.0,
                     }
                 }).collect();
+                // Crazyhouse pocket icons (empty outside Crazyhouse); extra
+                // pieces, no new pipeline.
+                self.push_pocket_icons(&mut pieces);
                 // Captured trays live in the player bars (Live/Play only); they
                 // are ordinary extra pieces, no new pipeline.
                 if let Some(rend) = self.renderer.as_ref() {
@@ -1331,22 +1519,42 @@ impl ApplicationHandler<NetEvent> for App {
                 };
 
                 // Once a press turns into a real drag, lift the piece off its
-                // square and let it follow the cursor. A plain click keeps the
+                // source and let it follow the cursor. A plain click keeps the
                 // board untouched (the piece is only hidden from the moment
-                // the pointer leaves the click slop).
+                // the pointer leaves the click slop). Pocket drags have no
+                // board square to hide, but share the lifted piece path.
                 let dragged = if self.ui.is_dragging() && self.ui.drag_moved() {
-                    self.ui.dragging_piece(board).map(|(from, role, color)| {
-                        (
-                            from,
+                    let cursor = (self.cursor_pos.0 as f32, self.cursor_pos.1 as f32);
+                    let size = self.ui.square_size();
+                    if let Some(role) = self.ui.dragging_pocket_piece() {
+                        // Only the side to move has a usable pocket, so the
+                        // dragged piece takes that side's colour.
+                        Some((
+                            renderer::DragSource::Pocket,
                             renderer::PieceElement {
                                 role,
-                                color,
-                                x: self.cursor_pos.0 as f32,
-                                y: self.cursor_pos.1 as f32,
-                                size: self.ui.square_size(),
+                                color: board.turn(),
+                                x: cursor.0,
+                                y: cursor.1,
+                                size,
+                                alpha: 1.0,
                             },
-                        )
-                    })
+                        ))
+                    } else {
+                        self.ui.dragging_piece(board).map(|(from, role, color)| {
+                            (
+                                renderer::DragSource::Board(from),
+                                renderer::PieceElement {
+                                    role,
+                                    color,
+                                    x: cursor.0,
+                                    y: cursor.1,
+                                    size,
+                                    alpha: 1.0,
+                                },
+                            )
+                        })
+                    }
                 } else {
                     None
                 };
@@ -1607,8 +1815,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn app_from_fen(fen: &str) -> App {
-        let board = position_from_fen("standard", fen).expect("valid test FEN");
+    fn app_with_board(board: VariantPosition) -> App {
         let side = board.turn();
         let mut app = App {
             proxy: None,
@@ -1629,6 +1836,14 @@ mod tests {
         };
         app.ui.layout(800.0, 600.0);
         app
+    }
+
+    fn app_from_fen(fen: &str) -> App {
+        app_with_board(position_from_fen("standard", fen).expect("valid test FEN"))
+    }
+
+    fn app_from_crazyhouse_fen(fen: &str) -> App {
+        app_with_board(position_from_fen("crazyhouse", fen).expect("valid crazyhouse FEN"))
     }
 
     /// A board with a white pawn on the 7th rank, ready to promote.
@@ -2083,6 +2298,200 @@ mod tests {
         assert!(!app.ui.is_dragging());
         assert!(app.live_board.as_ref().expect("live board").board().piece_at(e2).is_some());
         assert!(app.live_board.as_ref().expect("live board").board().piece_at(Square::E4).is_none());
+    }
+
+    #[test]
+    fn crazyhouse_pockets_come_straight_from_shakmaty() {
+        let fen = "4k3/8/8/8/8/8/8/4K3[QRBNPrbn] w - - 0 1";
+        let board = position_from_fen("crazyhouse", fen).expect("crazyhouse fen");
+        assert_eq!(
+            pocket_items(&board, Color::White),
+            vec![
+                (Role::Pawn, 1),
+                (Role::Knight, 1),
+                (Role::Bishop, 1),
+                (Role::Rook, 1),
+                (Role::Queen, 1),
+            ]
+        );
+        assert_eq!(
+            pocket_items(&board, Color::Black),
+            vec![(Role::Knight, 1), (Role::Bishop, 1), (Role::Rook, 1)]
+        );
+
+        let mut app = app_from_crazyhouse_fen(fen);
+        app.sync_pockets();
+        assert_eq!(app.ui.pockets(Color::White).len(), 5);
+        assert_eq!(app.ui.pockets(Color::Black).len(), 3);
+        // White is to move, so only White's pocket is usable.
+        assert!(app.ui.pockets(Color::White).iter().all(|p| p.interactive));
+        assert!(app.ui.pockets(Color::Black).iter().all(|p| !p.interactive));
+    }
+
+    #[test]
+    fn standard_chess_has_no_pocket_ui_or_drop_candidates() {
+        let board = VariantPosition::default();
+        assert!(pocket_items(&board, Color::White).is_empty());
+        assert!(pocket_items(&board, Color::Black).is_empty());
+        assert!(drop_squares(&board, Role::Knight).is_empty());
+
+        let mut app =
+            app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.sync_pockets();
+        assert!(app.ui.pockets(Color::White).is_empty());
+        assert!(app.ui.pockets(Color::Black).is_empty());
+        // Board clicks keep working exactly as before.
+        let (x, y) = square_center(&app, Square::E2);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.selected_square(), Some(Square::E2));
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+    }
+
+    #[test]
+    fn drops_are_identified_by_role_and_destination() {
+        let board = position_from_fen("crazyhouse", "4k3/8/8/8/8/8/8/4K3[Q] w - - 0 1")
+            .expect("crazyhouse fen");
+        let targets = drop_squares(&board, Role::Queen);
+        assert!(targets.contains(&Square::D4));
+        // Only empty squares: the kings' squares are never drop targets.
+        assert!(!targets.contains(&Square::E1));
+        assert!(!targets.contains(&Square::E8));
+
+        let mv = find_drop(&board, Role::Queen, Square::D4).expect("legal drop");
+        assert!(matches!(
+            mv,
+            Move::Put { role: Role::Queen, to: Square::D4 }
+        ));
+        assert_eq!(mv.from(), None, "drops have no origin square");
+
+        let mut after = board.clone();
+        after.play_unchecked(mv);
+        assert_eq!(
+            after.board().piece_at(Square::D4).map(|p| (p.role, p.color)),
+            Some((Role::Queen, Color::White))
+        );
+        let pockets = after.pockets().expect("crazyhouse pockets");
+        assert_eq!(*pockets.get(Color::White).get(Role::Queen), 0);
+    }
+
+    #[test]
+    fn pocket_click_then_target_click_drops_the_piece() {
+        let mut app = app_from_crazyhouse_fen("4k3/8/8/8/8/8/8/4K3[Q] w - - 0 1");
+        app.sync_pockets();
+        let icon = *app.ui.pockets(Color::White).first().expect("pocket queen");
+        assert_eq!(icon.role, Role::Queen);
+
+        // Clicking the pocket icon clears any board selection and lights up
+        // the legal landing squares.
+        app.handle_board_click(icon.rect.x + icon.rect.w * 0.5, icon.rect.y + icon.rect.h * 0.5);
+        assert_eq!(app.ui.selected_square(), None);
+        assert_eq!(app.ui.selected_pocket_piece(), Some(Role::Queen));
+        assert!(app.ui.is_move_target(Square::D4));
+
+        // Clicking a highlighted square plays the drop through apply_move.
+        let (x, y) = square_center(&app, Square::D4);
+        app.handle_board_click(x, y);
+        assert_eq!(
+            app.board.board().piece_at(Square::D4).map(|p| (p.role, p.color)),
+            Some((Role::Queen, Color::White))
+        );
+        let pockets = app.board.pockets().expect("crazyhouse pockets");
+        assert_eq!(*pockets.get(Color::White).get(Role::Queen), 0);
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+        assert!(!app.ui.is_move_target(Square::D4));
+        assert_eq!(app.history.last().map(String::as_str), Some("Q@d4"));
+        assert_eq!(app.board.turn(), Color::Black);
+    }
+
+    #[test]
+    fn dragging_from_the_pocket_drops_on_a_target() {
+        let mut app = app_from_crazyhouse_fen("r3k3/8/8/8/8/8/8/4K3[N] w - - 0 1");
+        app.sync_pockets();
+        let icon = *app.ui.pockets(Color::White).first().expect("pocket knight");
+        let (px, py) = (icon.rect.x + icon.rect.w * 0.5, icon.rect.y + icon.rect.h * 0.5);
+
+        app.handle_mouse_press(px, py);
+        assert_eq!(app.ui.selected_pocket_piece(), Some(Role::Knight));
+        assert_eq!(app.ui.dragging_pocket_piece(), Some(Role::Knight));
+        assert_eq!(app.ui.dragging_square(), None);
+
+        let (x, y) = square_center(&app, Square::F6);
+        assert!(app.handle_cursor_moved(x, y));
+        assert!(app.handle_mouse_release(x, y));
+
+        assert_eq!(
+            app.board.board().piece_at(Square::F6).map(|p| (p.role, p.color)),
+            Some((Role::Knight, Color::White))
+        );
+        let pockets = app.board.pockets().expect("crazyhouse pockets");
+        assert_eq!(*pockets.get(Color::White).get(Role::Knight), 0);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+        assert_eq!(app.board.turn(), Color::Black);
+    }
+
+    #[test]
+    fn pocket_drag_released_elsewhere_cancels_without_moving() {
+        let mut app = app_from_crazyhouse_fen("r3k3/8/8/8/8/8/8/4K3[N] w - - 0 1");
+        app.sync_pockets();
+        let icon = *app.ui.pockets(Color::White).first().expect("pocket knight");
+        let (px, py) = (icon.rect.x + icon.rect.w * 0.5, icon.rect.y + icon.rect.h * 0.5);
+
+        // Released outside the board: nothing is dropped and the pocket
+        // selection clears.
+        app.handle_mouse_press(px, py);
+        app.handle_cursor_moved(2.0, 2.0);
+        app.handle_mouse_release(2.0, 2.0);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+        assert_eq!(app.board.turn(), Color::White);
+        let pockets = app.board.pockets().expect("crazyhouse pockets");
+        assert_eq!(*pockets.get(Color::White).get(Role::Knight), 1);
+
+        // Released on an occupied, non-target square: still no drop.
+        app.handle_mouse_press(px, py);
+        let (x, y) = square_center(&app, Square::E1);
+        app.handle_cursor_moved(x, y);
+        app.handle_mouse_release(x, y);
+        assert!(!app.ui.is_dragging());
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+        assert_eq!(
+            app.board.board().piece_at(Square::E1).map(|p| p.role),
+            Some(Role::King)
+        );
+        let pockets = app.board.pockets().expect("crazyhouse pockets");
+        assert_eq!(*pockets.get(Color::White).get(Role::Knight), 1);
+    }
+
+    #[test]
+    fn only_the_side_to_move_has_a_usable_local_pocket() {
+        let mut app = app_from_crazyhouse_fen("4k3/8/8/8/8/8/8/4K3[Nn] b - - 0 1");
+        app.sync_pockets();
+        assert!(app.ui.pockets(Color::Black).iter().all(|p| p.interactive));
+        assert!(app.ui.pockets(Color::White).iter().all(|p| !p.interactive));
+        // The dimmed pocket does not even hit-test.
+        let icon = *app.ui.pockets(Color::White).first().expect("pocket knight");
+        app.handle_board_click(
+            icon.rect.x + icon.rect.w * 0.5,
+            icon.rect.y + icon.rect.h * 0.5,
+        );
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+    }
+
+    #[test]
+    fn live_crazyhouse_pockets_are_display_only() {
+        let mut app = app_from_crazyhouse_fen("4k3/8/8/8/8/8/8/4K3[Q] w - - 0 1");
+        let live = app.board.clone();
+        app.mode = Mode::Live;
+        app.live_board = Some(live);
+        app.sync_pockets();
+
+        assert_eq!(app.ui.pockets(Color::White).len(), 1);
+        assert!(app.ui.pockets(Color::White).iter().all(|p| !p.interactive));
+        let icon = *app.ui.pockets(Color::White).first().expect("pocket queen");
+        app.handle_board_click(icon.rect.x + icon.rect.w * 0.5, icon.rect.y + icon.rect.h * 0.5);
+        assert_eq!(app.ui.selected_pocket_piece(), None);
+        assert!(!app.ui.is_dragging());
     }
 
     /// Text element whose contents match `needle`.

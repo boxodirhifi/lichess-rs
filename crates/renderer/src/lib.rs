@@ -15,8 +15,8 @@ use quad_pipeline::QuadPipeline;
 use text_pipeline::TextPipeline;
 
 /// A single piece drawn at an arbitrary screen position (e.g. the promotion
-/// menu). Board pieces come from the position itself; both go through the
-/// same SVG-atlas textured-quad path.
+/// menu or a Crazyhouse pocket). Board pieces come from the position itself;
+/// both go through the same SVG-atlas textured-quad path.
 #[derive(Debug, Clone, Copy)]
 pub struct PieceElement {
     pub role: Role,
@@ -26,6 +26,18 @@ pub struct PieceElement {
     pub y: f32,
     /// Edge length in pixels; the piece fills its square.
     pub size: f32,
+    /// Straight-alpha multiplier; 1.0 is the normal SVG opacity, pocket pieces
+    /// that cannot be dropped use ~0.5 to read as disabled.
+    pub alpha: f32,
+}
+
+/// Which part of the UI a dragged piece was lifted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragSource {
+    /// A board square: its piece is hidden while the drag runs.
+    Board(Square),
+    /// A Crazyhouse pocket: nothing on the board is hidden.
+    Pocket,
 }
 
 pub struct Scene<'a> {
@@ -37,9 +49,9 @@ pub struct Scene<'a> {
     pub texts: &'a [TextElement],
     /// Extra pieces to draw (e.g. a promotion menu); drawn after the board pieces.
     pub pieces: &'a [PieceElement],
-    /// A piece being dragged: the board square to leave out, plus the element
-    /// to draw under the cursor. Drawn last, so it floats above the board.
-    pub dragged: Option<(Square, PieceElement)>,
+    /// A piece being dragged: where it came from, plus the element to draw
+    /// under the cursor. Drawn last, so it floats above everything else.
+    pub dragged: Option<(DragSource, PieceElement)>,
 }
 
 pub struct Renderer {

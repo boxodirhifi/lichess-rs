@@ -112,6 +112,27 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    `App.history` keeps SAN (`San::from_move`) for the last ~30 plies and renders a
    right-side column only when the board leaves ≥300 px of spare width — no
    scrolling, no input, no PGN export.
+11. **Crazyhouse pockets are shakmaty's; drops are ordinary moves.** Pocket contents
+   come straight from `VariantPosition::pockets()` (authoritative per-side
+   `ByRole<u8>`, no captured-material count-diff). The client groups them
+   pawn→queen and hands `ui.set_pocket` only what to draw; `ui` lays out two rows
+   just outside the player bars (Black above, White below, board-left aligned,
+   0.45× square icons, `xN` badges) so names, clocks and the move-history column
+   never collide; a row that runs past the board edge is truncated with `…`. Other
+   variants have no pockets, so the rows stay empty — the pocket UI is
+   Crazyhouse-only. Only the side to move can drop: Live is display-only (dimmed at
+   0.5 alpha), Local enables the side-to-move pocket, Play only `my_color` while
+   the game runs and it is my turn. Clicking a usable pocket piece stores
+   `ui.selected_pocket_piece` (mutually exclusive with `selected`) and highlights
+   the legal landing squares from `legal_moves()` filtered to `Move::Put { role, .. }`
+   in the normal TARGET tint; dropping finds the matching `Move::Put { role, to }`
+   and goes through `apply_move` like any other move (no last-move origin, SAN is
+   e.g. `Q@d4`). A pocket piece can also be dragged: `ui.dragging_pocket` is
+   exclusive with a board drag, the lifted piece follows the cursor through
+   `Scene.dragged` with `DragSource::Pocket` (the board hides nothing), and
+   releasing on a target drops it while releasing anywhere else cancels.
+   `PieceElement.alpha` drives the dimming (renderer multiplies it into the
+   sampled SVG alpha only).
 
 ## Coding Conventions
 
@@ -130,7 +151,9 @@ cargo build && cargo test && cargo run
 
 App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `Esc` = close
 promotion menu. Pieces move by click-click or drag-and-drop (press a piece, drag to
-a legal target, release); a press/release without moving stays a plain click.
+a legal target, release); a press/release without moving stays a plain click. In
+Crazyhouse, clicking a pocket piece highlights its legal drops (click one, or drag
+the piece out and release there); dimmed pocket rows are display-only.
 
 ## Roadmap
 
@@ -150,6 +173,10 @@ Completed:
 - [x] **Phase A polish**: last-move highlight in Local/Live/Play (derived from FEN
   diffs while spectating), captured-piece trays + `+N` material next to the leading
   clock, and a SAN move-history column when the window leaves ≥300 px of spare width
+- [x] **Phase B — Crazyhouse pockets**: authoritative `pockets()` rows outside the
+  player bars (grouped pawn→queen, `xN` badges, dimmed when not droppable),
+  click-to-select + drag-to-drop through `Move::Put`, playable in Local/Play and
+  display-only in Live; non-Crazyhouse positions render no pockets
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -170,7 +197,8 @@ Next:
   UCI replay of the server move list via `replay_uci`. What remains is
   challenge UX (opponent/clock/time-control setup), takebacks/claims, and the
   swap from "echo the server" latency smoothing.
-- [ ] Variant *play* (Crazyhouse drops etc.) — spectate-only today.
+- [ ] Variant *play* beyond Crazyhouse drops (Atomic, Horde, three-check, …) —
+  spectate-only today.
 - [ ] Theming — and only then `notify` for hot-reload
 
 ## Migration Spec: shakmaty (execute in order, one commit per stage)
