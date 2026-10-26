@@ -130,6 +130,8 @@ struct App {
     /// SAN of every move seen in the current game, oldest first. Rebuilt only
     /// from applied/derived moves; cleared on a new game or a mode switch.
     history: Vec<String>,
+    /// Transient Atomic blast; `None` when idle and in every other variant.
+    explosion: Option<Explosion>,
 }
 
 /// Map a Lichess TV channel key to its shakmaty variant. `Variant::from_ascii`
@@ -319,6 +321,127 @@ fn derive_last_move(prev: &VariantPosition, next: &VariantPosition) -> Option<(S
     let mv = derive_played_move(prev, next)?;
     // Variant-only moves (Crazyhouse drops) have no origin square.
     Some((mv.from()?, move_destination(mv, prev)))
+}
+
+/// Atomic blast flash lifetime, in milliseconds.
+const EXPLOSION_MS: f32 = 500.0;
+/// Captured pieces disappear faster than the rest of the blast.
+const CAPTURED_FADE_MS: f32 = 200.0;
+/// Peak flash alpha over the base square colour (the UI blends it in).
+const EXPLOSION_ALPHA: f32 = 0.8;
+
+/// One piece the blast removed, snapshotted from the pre-move position so it
+/// can fade out over the after-move board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExplosionGhost {
+    role: Role,
+    color: Color,
+    square: Square,
+    /// The piece captured on the destination square (fades in 200 ms).
+    captured: bool,
+}
+
+/// A transient Atomic explosion. The board already holds the result; this is
+/// purely the visual: the flashed radius, the removed pieces, and when the
+/// effect started.
+struct Explosion {
+    squares: Vec<Square>,
+    ghosts: Vec<ExplosionGhost>,
+    start: Instant,
+}
+
+/// Blast radius in Atomic: the capture square plus its Moore neighbourhood,
+/// clipped to the board. shakmaty removes the same neighbourhood (minus
+/// explosion-immune pawns); this list is only for the flash.
+fn explosion_squares(center: Square) -> Vec<Square> {
+    let file = center.file().to_u32() as i32;
+    let rank = center.rank().to_u32() as i32;
+    let mut squares = Vec::with_capacity(9);
+    for df in -1..=1 {
+        for dr in -1..=1 {
+            let f = file + df;
+            let r = rank + dr;
+            if (0..8).contains(&f) && (0..8).contains(&r) {
+                squares.push(Square::new((r * 8 + f) as u32));
+            }
+        }
+    }
+    squares.sort_by_key(|sq| *sq as u8);
+    squares
+}
+
+/// The square whose piece was captured: the destination, except for en
+/// passant where the pawn stands beside it.
+fn captured_square(mv: Move) -> Option<Square> {
+    match mv {
+        Move::Normal { capture: Some(_), to, .. } => Some(to),
+        Move::EnPassant { from, to } => Some(Square::from_coords(to.file(), from.rank())),
+        _ => None,
+    }
+}
+
+/// Build the visual blast for `mv` when it is a capture in an Atomic position.
+/// `prev` is the position before the move and `next` after it. Ghosts are only
+/// pieces shakmaty actually removed, so explosion-immune pawns stay solid.
+fn explosion_for(
+    prev: &VariantPosition,
+    next: &VariantPosition,
+    mv: Move,
+) -> Option<Explosion> {
+    if prev.variant() != Variant::Atomic {
+        return None;
+    }
+    let captured = captured_square(mv)?;
+    let squares = explosion_squares(mv.to());
+    let ghosts = squares
+        .iter()
+        .filter(|sq| Some(**sq) != mv.from())
+        .filter_map(|&sq| {
+            let before = prev.board().piece_at(sq)?;
+            // The mover left its origin; pawns are immune; anything else that
+            // changed on these squares was destroyed by the blast.
+            if next.board().piece_at(sq) == Some(before) {
+                return None;
+            }
+            Some(ExplosionGhost {
+                role: before.role,
+                color: before.color,
+                square: sq,
+                captured: sq == captured,
+            })
+        })
+        .collect();
+    Some(Explosion {
+        squares,
+        ghosts,
+        start: Instant::now(),
+    })
+}
+
+/// Flash strength at `elapsed_ms`: bright at the start, easing to zero across
+/// the 500 ms window.
+fn explosion_flash(elapsed_ms: f32) -> f32 {
+    let t = (elapsed_ms / EXPLOSION_MS).clamp(0.0, 1.0);
+    EXPLOSION_ALPHA * (1.0 - t * t)
+}
+
+/// Ghost alpha: linear 1 → 0 over the blast window; the captured piece uses a
+/// shorter 200 ms window so the capture reads immediately.
+fn explosion_piece_alpha(elapsed_ms: f32, captured: bool) -> f32 {
+    let window = if captured {
+        CAPTURED_FADE_MS
+    } else {
+        EXPLOSION_MS
+    };
+    (1.0 - elapsed_ms / window).clamp(0.0, 1.0)
+}
+
+/// Screen centre of a board square for the extra-piece pass.
+fn piece_center(offset: (f32, f32), sq: f32, square: Square) -> (f32, f32) {
+    (
+        offset.0 + (square.file().to_u32() as f32 + 0.5) * sq,
+        offset.1 + (7.0 - square.rank().to_u32() as f32 + 0.5) * sq,
+    )
 }
 
 /// How many captured-piece icons fit in the row from `start` to `end`.
@@ -956,6 +1079,18 @@ impl App {
     /// and a background POST for online play. Either way, the from/to squares
     /// become the last-move highlight (castling maps to the king's destination).
     fn apply_move(&mut self, mv: Move) {
+        // Atomic captures need the pre-move position to snapshot the pieces
+        // the blast removes. The board is updated immediately either way.
+        let atomic_prev = if self.mode == Mode::Local {
+            match self.active_board_ref() {
+                Some(pos) if pos.variant() == Variant::Atomic && mv.capture().is_some() => {
+                    Some(pos.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let (last, san) = match self.active_board_ref() {
             Some(pos) => (
                 mv.from().map(|from| (from, move_destination(mv, pos))),
@@ -967,6 +1102,8 @@ impl App {
             self.board.play_unchecked(mv);
             self.side = self.board.turn();
             self.refresh_check_highlight();
+            self.explosion =
+                atomic_prev.and_then(|prev| explosion_for(&prev, &self.board, mv));
         } else {
             self.post_online_move(mv);
         }
@@ -998,9 +1135,48 @@ impl App {
                 self.history.push(San::from_move(prev, mv).to_string());
                 self.ui
                     .set_last_move(mv.from().map(|from| (from, move_destination(mv, prev))));
+                // Background TV keeps running in every mode; only the Live
+                // view may turn its captures into a blast.
+                if self.mode == Mode::Live {
+                    self.explosion = explosion_for(prev, board, mv);
+                }
             }
-            None => self.ui.set_last_move(None),
+            None => {
+                self.ui.set_last_move(None);
+                if self.mode == Mode::Live {
+                    self.explosion = None;
+                }
+            }
         }
+    }
+
+    /// Age the current blast by one frame: drop it when the window is over,
+    /// otherwise push the eased flash strength into the UI. Idle frames (no
+    /// explosion) clear a leftover tint once and cost nothing afterwards.
+    fn tick_explosion(&mut self) -> Option<f32> {
+        let elapsed = self
+            .explosion
+            .as_ref()
+            .map(|explosion| explosion.start.elapsed().as_secs_f32() * 1000.0);
+        let Some(elapsed) = elapsed else {
+            self.ui.clear_explosion();
+            return None;
+        };
+        if elapsed >= EXPLOSION_MS {
+            self.explosion = None;
+            self.ui.clear_explosion();
+            return None;
+        }
+        if let Some(explosion) = &self.explosion {
+            self.ui
+                .set_explosion(&explosion.squares, explosion_flash(elapsed));
+        }
+        Some(elapsed)
+    }
+
+    fn clear_explosion(&mut self) {
+        self.explosion = None;
+        self.ui.clear_explosion();
     }
 
     fn handle_board_click(&mut self, x: f32, y: f32) {
@@ -1228,6 +1404,9 @@ impl ApplicationHandler<NetEvent> for App {
                 // A new featured game starts with no previous move.
                 self.ui.set_last_move(None);
                 self.history.clear();
+                if self.mode == Mode::Live {
+                    self.clear_explosion();
+                }
                 self.live_info = Some(LiveGameInfo {
                     white_name,
                     black_name,
@@ -1322,7 +1501,11 @@ impl ApplicationHandler<NetEvent> for App {
                     let prev = game.board.clone();
                     replay_uci(&mut game.board, &moves);
                     if prev.board() != game.board.board() {
-                        advanced = Some(derive_last_move(&prev, &game.board));
+                        let played = derive_played_move(&prev, &game.board);
+                        advanced = Some((
+                            derive_last_move(&prev, &game.board),
+                            played.and_then(|mv| explosion_for(&prev, &game.board, mv)),
+                        ));
                     }
                     game.white_clock = wtime_ms as f64 / 1000.0;
                     game.black_clock = btime_ms as f64 / 1000.0;
@@ -1330,8 +1513,12 @@ impl ApplicationHandler<NetEvent> for App {
                     game.game_over = status != "started";
                     game.winner = winner;
                 }
-                if let Some(last) = advanced {
+                if let Some((last, explosion)) = advanced {
                     self.ui.set_last_move(last);
+                    // Background streams must not animate another mode's game.
+                    if self.mode == Mode::Play {
+                        self.explosion = explosion;
+                    }
                 }
             }
             NetEvent::OnlineFailed { message } => {
@@ -1412,6 +1599,7 @@ impl ApplicationHandler<NetEvent> for App {
                         self.ui.set_checked_king(None);
                         self.ui.set_last_move(None);
                         self.history.clear();
+                        self.clear_explosion();
                         needs_redraw = true;
                     }
                     KeyCode::KeyP => {
@@ -1420,6 +1608,7 @@ impl ApplicationHandler<NetEvent> for App {
                         self.refresh_check_highlight();
                         self.ui.set_last_move(None);
                         self.history.clear();
+                        self.clear_explosion();
                         needs_redraw = true;
                     }
                     KeyCode::KeyC => {
@@ -1428,6 +1617,7 @@ impl ApplicationHandler<NetEvent> for App {
                         self.ui.clear_promotion();
                         self.ui.set_last_move(None);
                         self.history.clear();
+                        self.clear_explosion();
                         self.online_error = None;
                         self.start_online_challenge();
                         needs_redraw = true;
@@ -1440,6 +1630,9 @@ impl ApplicationHandler<NetEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Age the Atomic blast first: it also refreshes the square
+                // flash before the quads below are built.
+                let explosion_age = self.tick_explosion();
                 // Derive the pocket rows before anything reads them for layout.
                 self.sync_pockets();
                 let texts = self.build_texts();
@@ -1473,6 +1666,24 @@ impl ApplicationHandler<NetEvent> for App {
                 // are ordinary extra pieces, no new pipeline.
                 if let Some(rend) = self.renderer.as_ref() {
                     self.push_captured_icons(rend, &mut pieces);
+                }
+                // Removed Atomic pieces fade out over the already-updated
+                // board; ghosts are ordinary extra pieces (the capture ghost
+                // sits over the capturing piece for its 200 ms fade).
+                let (ox, oy) = self.ui.board_offset();
+                let sq = self.ui.square_size();
+                if let (Some(age), Some(explosion)) = (explosion_age, self.explosion.as_ref()) {
+                    for ghost in &explosion.ghosts {
+                        let (x, y) = piece_center((ox, oy), sq, ghost.square);
+                        pieces.push(renderer::PieceElement {
+                            role: ghost.role,
+                            color: ghost.color,
+                            x,
+                            y,
+                            size: sq,
+                            alpha: explosion_piece_alpha(age, ghost.captured),
+                        });
+                    }
                 }
                 let banner: Option<String> = match self.mode {
                     Mode::Local => App::game_banner(&self.board),
@@ -1572,6 +1783,9 @@ impl ApplicationHandler<NetEvent> for App {
                     };
                     rend.render(&scene);
                 }
+                // Keep animating only while the blast is alive; once it
+                // expires the loop drops back to Wait with no timer.
+                needs_redraw = explosion_age.is_some();
             }
             _ => {}
         }
@@ -1807,6 +2021,7 @@ fn main() {
         online: Online::Idle,
         online_error: None,
         history: Vec::new(),
+        explosion: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -1833,6 +2048,7 @@ mod tests {
             online: Online::Idle,
             online_error: None,
             history: Vec::new(),
+            explosion: None,
         };
         app.ui.layout(800.0, 600.0);
         app
@@ -1844,6 +2060,18 @@ mod tests {
 
     fn app_from_crazyhouse_fen(fen: &str) -> App {
         app_with_board(position_from_fen("crazyhouse", fen).expect("valid crazyhouse FEN"))
+    }
+
+    fn app_from_atomic_fen(fen: &str) -> App {
+        app_with_board(position_from_fen("atomic", fen).expect("valid atomic FEN"))
+    }
+
+    /// The legal move between two squares, for test setups.
+    fn find_move(pos: &VariantPosition, from: Square, to: Square) -> Move {
+        pos.legal_moves()
+            .into_iter()
+            .find(|mv| mv.from() == Some(from) && mv.to() == to)
+            .unwrap_or_else(|| panic!("missing legal move {from:?}-{to:?}"))
     }
 
     /// A board with a white pawn on the 7th rank, ready to promote.
@@ -2492,6 +2720,230 @@ mod tests {
         app.handle_board_click(icon.rect.x + icon.rect.w * 0.5, icon.rect.y + icon.rect.h * 0.5);
         assert_eq!(app.ui.selected_pocket_piece(), None);
         assert!(!app.ui.is_dragging());
+    }
+
+    #[test]
+    fn atomic_explosion_radius_is_the_moore_neighbourhood() {
+        // An interior capture touches nine squares.
+        let e4 = explosion_squares(Square::E4);
+        assert_eq!(e4.len(), 9);
+        for sq in [
+            Square::E4,
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::E3,
+            Square::E5,
+            Square::F3,
+            Square::F4,
+            Square::F5,
+        ] {
+            assert!(e4.contains(&sq), "missing {sq:?}");
+        }
+
+        // Edge and corner blasts clip to the board instead of wrapping.
+        assert_eq!(explosion_squares(Square::A1).len(), 4);
+        assert_eq!(explosion_squares(Square::H4).len(), 6);
+        assert!(!explosion_squares(Square::A1).contains(&Square::H1));
+    }
+
+    #[test]
+    fn atomic_capture_reports_the_blast_and_removed_pieces() {
+        // exd5 with a black knight on c6 (explodes) and a white pawn on e6
+        // (pawns are immune to Atomic explosions and must stay solid).
+        let prev = position_from_fen(
+            "atomic",
+            "4k3/8/2n1P3/3p4/4P3/8/8/4K3 w - - 0 1",
+        )
+        .expect("atomic fen");
+        let mv = find_move(&prev, Square::E4, Square::D5);
+        let mut next = prev.clone();
+        next.play_unchecked(mv);
+
+        let explosion = explosion_for(&prev, &next, mv).expect("atomic capture explodes");
+        assert_eq!(explosion.squares.len(), 9);
+        for sq in [Square::D5, Square::C6, Square::E6, Square::C4, Square::E4] {
+            assert!(explosion.squares.contains(&sq), "missing {sq:?}");
+        }
+
+        let captured = explosion
+            .ghosts
+            .iter()
+            .find(|ghost| ghost.square == Square::D5)
+            .expect("captured pawn ghost");
+        assert!(captured.captured, "the piece on the destination fades faster");
+        assert_eq!((captured.role, captured.color), (Role::Pawn, Color::Black));
+
+        let knight = explosion
+            .ghosts
+            .iter()
+            .find(|ghost| ghost.square == Square::C6)
+            .expect("adjacent knight ghost");
+        assert!(!knight.captured);
+        assert_eq!(knight.role, Role::Knight);
+
+        // Neither the mover's origin nor the immune pawn becomes a ghost;
+        // both survive shakmaty's blast.
+        assert!(!explosion.ghosts.iter().any(|ghost| ghost.square == Square::E4));
+        assert!(!explosion.ghosts.iter().any(|ghost| ghost.square == Square::E6));
+        assert_eq!(
+            next.board().piece_at(Square::E6).map(|p| (p.role, p.color)),
+            Some((Role::Pawn, Color::White))
+        );
+    }
+
+    #[test]
+    fn only_atomic_captures_explode() {
+        let quiet_prev =
+            position_from_fen("atomic", "4k3/8/2n5/3p4/4P3/8/8/4K3 w - - 0 1")
+                .expect("atomic fen");
+        let quiet = find_move(&quiet_prev, Square::E4, Square::E5);
+        let mut quiet_next = quiet_prev.clone();
+        quiet_next.play_unchecked(quiet);
+        assert!(explosion_for(&quiet_prev, &quiet_next, quiet).is_none());
+
+        let standard = position_from_fen(
+            "standard",
+            "r3k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1",
+        )
+        .expect("standard fen");
+        let capture = find_move(&standard, Square::E4, Square::D5);
+        let mut next = standard.clone();
+        next.play_unchecked(capture);
+        assert!(
+            explosion_for(&standard, &next, capture).is_none(),
+            "captures outside Atomic stay quiet"
+        );
+    }
+
+    #[test]
+    fn explosion_alpha_fades_over_its_window() {
+        assert!((explosion_flash(0.0) - 0.8).abs() < 1e-6);
+        assert!((explosion_flash(250.0) - 0.6).abs() < 1e-6);
+        assert!((explosion_flash(500.0) - 0.0).abs() < 1e-6);
+        assert_eq!(explosion_flash(600.0), 0.0);
+        assert!(explosion_flash(100.0) < explosion_flash(50.0));
+        assert!(explosion_flash(300.0) < explosion_flash(100.0));
+
+        assert!((explosion_piece_alpha(0.0, false) - 1.0).abs() < 1e-6);
+        assert!((explosion_piece_alpha(250.0, false) - 0.5).abs() < 1e-6);
+        assert_eq!(explosion_piece_alpha(500.0, false), 0.0);
+        assert!(explosion_piece_alpha(600.0, false) == 0.0);
+        // The captured piece goes over 200 ms, so it is half gone at 100 ms.
+        assert!((explosion_piece_alpha(100.0, true) - 0.5).abs() < 1e-6);
+        assert_eq!(explosion_piece_alpha(200.0, true), 0.0);
+    }
+
+    #[test]
+    fn local_atomic_capture_starts_a_blast_and_a_second_one_overwrites_it() {
+        // White c4/e4 pawns, Black b5/d5 pawns. Atomic captures explode both
+        // the capturing and the captured piece, so exd5 empties d5 while the
+        // adjacent c4 pawn survives (pawns are immune to the blast).
+        let mut app = app_from_atomic_fen("4k3/8/8/1p1p4/2P1P3/8/8/4K3 w - - 0 1");
+        let first = find_move(&app.board, Square::E4, Square::D5);
+        app.apply_move(first);
+
+        let first_blast = app.explosion.as_ref().expect("first blast");
+        let first_squares = first_blast.squares.clone();
+        assert!(first_squares.contains(&Square::D5));
+        assert_eq!(
+            first_blast
+                .ghosts
+                .iter()
+                .map(|ghost| ghost.square)
+                .collect::<Vec<_>>(),
+            vec![Square::D5],
+            "the captured pawn is the only removed piece; c4 is immune"
+        );
+        assert!(app.board.board().piece_at(Square::D5).is_none());
+        assert_eq!(
+            app.board.board().piece_at(Square::C4).map(|p| (p.role, p.color)),
+            Some((Role::Pawn, Color::White)),
+            "shakmaty keeps pawns out of the blast"
+        );
+
+        // Black takes back on c4: a second blast at a different centre.
+        let second = find_move(&app.board, Square::B5, Square::C4);
+        app.apply_move(second);
+
+        let second_blast = app.explosion.as_ref().expect("second blast");
+        assert_ne!(second_blast.squares, first_squares, "the new blast wins");
+        assert!(second_blast.squares.contains(&Square::C4));
+        assert!(second_blast.squares.contains(&Square::B3));
+        assert!(!second_blast.squares.contains(&Square::E5));
+        assert_eq!(
+            second_blast
+                .ghosts
+                .iter()
+                .map(|ghost| ghost.square)
+                .collect::<Vec<_>>(),
+            vec![Square::C4]
+        );
+        // The board is the authoritative result: both pawns at the second
+        // blast are gone and no stale first-blast ghost is left behind.
+        assert!(app.board.board().piece_at(Square::C4).is_none());
+        assert!(app.board.board().piece_at(Square::B5).is_none());
+        assert!(app.board.board().piece_at(Square::D5).is_none());
+    }
+
+    #[test]
+    fn an_explosion_expires_after_its_window() {
+        let mut app = app_from_atomic_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1");
+        let mv = find_move(&app.board, Square::E4, Square::D5);
+        app.apply_move(mv);
+        assert!(app.explosion.is_some());
+        assert!(app.tick_explosion().is_some(), "a fresh blast is animating");
+
+        // Pretend the effect started more than 500 ms ago.
+        if let Some(explosion) = app.explosion.as_mut() {
+            explosion.start = Instant::now() - Duration::from_millis(600);
+        }
+        assert_eq!(app.tick_explosion(), None);
+        assert!(app.explosion.is_none(), "the expired blast is dropped");
+    }
+
+    #[test]
+    fn live_atomic_capture_derives_the_blast() {
+        let prev = position_from_fen("atomic", "4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1")
+            .expect("atomic fen");
+        let mv = find_move(&prev, Square::E4, Square::D5);
+        let mut next = prev.clone();
+        next.play_unchecked(mv);
+
+        let mut app = app_from_atomic_fen("4k3/8/8/3p4/4P3/8/8/4K3 b - - 0 1");
+        app.mode = Mode::Live;
+        app.live_board = Some(prev);
+        app.note_live_move(&next);
+
+        let explosion = app.explosion.as_ref().expect("TV capture explodes");
+        assert!(explosion.squares.contains(&Square::D5));
+        assert!(explosion.ghosts.iter().any(|ghost| ghost.square == Square::D5));
+
+        // A quiet TV move clears the blast rather than leaving it stale.
+        let quiet_prev = next;
+        let quiet = find_move(&quiet_prev, Square::E8, Square::E7);
+        let mut quiet_next = quiet_prev.clone();
+        quiet_next.play_unchecked(quiet);
+        app.live_board = Some(quiet_prev);
+        app.note_live_move(&quiet_next);
+        assert!(app.explosion.is_none());
+    }
+
+    #[test]
+    fn background_tv_captures_do_not_explode_local_games() {
+        let prev = position_from_fen("atomic", "4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1")
+            .expect("atomic fen");
+        let mv = find_move(&prev, Square::E4, Square::D5);
+        let mut next = prev.clone();
+        next.play_unchecked(mv);
+
+        let mut app = app_from_atomic_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        app.live_board = Some(prev);
+        app.note_live_move(&next);
+        assert!(
+            app.explosion.is_none(),
+            "the Live background stream must not animate Local play"
+        );
     }
 
     /// Text element whose contents match `needle`.

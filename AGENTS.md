@@ -133,6 +133,23 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    releasing on a target drops it while releasing anywhere else cancels.
    `PieceElement.alpha` drives the dimming (renderer multiplies it into the
    sampled SVG alpha only).
+12. **Atomic blasts are a transient visual, never board state.** A capture in
+   `Variant::Atomic` starts an `App.explosion` (blast squares + ghost snapshots +
+   `Instant`). Local derives it in `apply_move` from the pre-move clone, Live in
+   `note_live_move` from the FEN diff, Play from `derive_played_move` on the board
+   stream's echoed move list; background streams are gated on the current mode so
+   a TV game can never animate a local game (and vice versa). The radius is the
+   capture square plus its Moore neighbourhood (`explosion_squares`, clipped at
+   the edges). The flash is `0.8 * (1 - t²)` over 500 ms blended into the **base**
+   square colour inside `ui` (`set_explosion`/`clear_explosion`), so
+   check → selected → target → last-move highlights still win over it. Ghosts are
+   exactly the pieces shakmaty's board diff says disappeared — explosion-immune
+   pawns and the mover's origin never fade — drawn as ordinary `Scene.pieces`
+   after the captured trays (drags still render on top); the destination ghost
+   fades in 200 ms, the others over 500 ms. `tick_explosion()` runs only on the
+   redraw path and keeps `needs_redraw` true while the effect lives, then the loop
+   drops back to `Wait` (no timer, no idle work). Mode switches and new featured
+   games clear the blast; other variants never set it.
 
 ## Coding Conventions
 
@@ -177,6 +194,10 @@ Completed:
   player bars (grouped pawn→queen, `xN` badges, dimmed when not droppable),
   click-to-select + drag-to-drop through `Move::Put`, playable in Local/Play and
   display-only in Live; non-Crazyhouse positions render no pockets
+- [x] **Phase B (extended) — Atomic explosions**: Atomic captures flash the 3×3
+  blast radius for 500 ms (ease-out, under the interaction highlights) and fade the
+  pieces shakmaty actually removes (the destination faster, 200 ms); drives Local,
+  Live and Play, cleared on mode/game switches and absent in every other variant
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -189,6 +210,10 @@ Known limitations:
   reads as a captured enemy piece. Spectate mode has no true move history to correct
   this (moves are derived from FEN diffs), so expect up to one pawn unit of drift per
   promotion; online play is close but not exact either.
+- **The Atomic capturing piece does not ghost.** shakmaty removes it along with the
+  captured piece, but it shares the destination square, so a second ghost there
+  would overlap the captured one. The destination ghost shows the captured piece
+  (200 ms) and the 500 ms flash covers the capturer's disappearance.
 
 Next:
 - [ ] Finish playable online games. Scaffolding already in the client:

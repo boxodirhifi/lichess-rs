@@ -17,8 +17,22 @@ const TARGET: [f32; 3] = [0.30, 0.55, 0.85];
 /// Muted yellow over both squares of the last played move (Lichess-style).
 const LAST_MOVE: [f32; 3] = [205.0 / 255.0, 178.0 / 255.0, 80.0 / 255.0];
 const CHECK: [f32; 3] = [0.85, 0.25, 0.25];
+/// Bright blast tint for Atomic explosions, blended over the base square
+/// colour (and under every selection/target/check/last-move tint).
+const EXPLOSION: [f32; 3] = [1.0, 1.0, 0.7];
 const PANEL: [f32; 3] = [0.24, 0.23, 0.22];
 const PANEL_CELL: [f32; 3] = [0.86, 0.82, 0.74];
+
+/// Linear blend of two RGB colours; `t` is clamped, so callers can pass an
+/// eased 0..1 flash strength straight through.
+fn blend(from: [f32; 3], to: [f32; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        from[0] + (to[0] - from[0]) * t,
+        from[1] + (to[1] - from[1]) * t,
+        from[2] + (to[2] - from[2]) * t,
+    ]
+}
 
 /// One entry of the promotion menu: where it sits and what it promotes to.
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +87,10 @@ pub struct UI {
     pocket_truncated: [bool; 2],
     /// X position just past the last pocket element, per colour.
     pocket_end: [f32; 2],
+    /// Atomic blast squares and the current (already eased) flash strength.
+    /// Blended into the base square colour only, so highlights stay on top.
+    explosion: Vec<Square>,
+    explosion_flash: f32,
     checked_king: Option<Square>,
     /// From/to squares of the last played move, tinted in both play and TV.
     last_move: Option<(Square, Square)>,
@@ -271,8 +289,13 @@ impl UI {
         for (i, rect) in self.squares.iter_mut().enumerate() {
             let row = i / 8;
             let col = i % 8;
-            let base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
+            let mut base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
             let sq = Self::square_at_index(i);
+            // The blast sits directly on the board colour, below every
+            // interaction highlight (which therefore never gets overridden).
+            if self.explosion_flash > 0.0 && self.explosion.contains(&sq) {
+                base = blend(base, EXPLOSION, self.explosion_flash);
+            }
             rect.color = if self.checked_king == Some(sq) {
                 CHECK
             } else if self.selected == Some(sq) {
@@ -335,6 +358,28 @@ impl UI {
 
     pub fn selected_pocket_piece(&self) -> Option<Role> {
         self.selected_pocket_piece
+    }
+
+    /// Refresh the Atomic blast tint. `strength` is the already-eased flash
+    /// alpha (0 hides it); the squares are only highlighted where no
+    /// selection/target/check/last-move tint applies.
+    pub fn set_explosion(&mut self, squares: &[Square], strength: f32) {
+        self.explosion.clear();
+        if strength > 0.0 {
+            self.explosion.extend_from_slice(squares);
+        }
+        self.explosion_flash = strength.max(0.0);
+        self.apply_colors();
+    }
+
+    /// Remove the blast tint (no-op when there is none, to avoid needless
+    /// colour recomputation at idle).
+    pub fn clear_explosion(&mut self) {
+        if !self.explosion.is_empty() || self.explosion_flash != 0.0 {
+            self.explosion.clear();
+            self.explosion_flash = 0.0;
+            self.apply_colors();
+        }
     }
 
     /// Replace one colour's pocket row. `items` is grouped by role (pawns
@@ -911,5 +956,37 @@ mod tests {
         assert!(ui.pockets(Color::White).len() < items.len());
         let right = ui.board_offset().0 + ui.square_size() * 8.0;
         assert!(ui.pocket_end(Color::White) <= right);
+    }
+
+    #[test]
+    fn explosion_tint_sits_on_the_base_square_and_under_highlights() {
+        let mut ui = ui_at(1000.0, 1000.0);
+        let (e4, d5) = (Square::E4, Square::D5);
+
+        // E4 is a light square: a full-strength blast turns it bright yellow.
+        ui.set_explosion(&[e4], 1.0);
+        assert_eq!(square_color(&ui, e4), EXPLOSION);
+        // Half strength is a linear blend between the base and the blast.
+        ui.set_explosion(&[e4], 0.5);
+        let half = blend(LIGHT, EXPLOSION, 0.5);
+        for (got, want) in square_color(&ui, e4).iter().zip(half.iter()) {
+            assert!((got - want).abs() < 1e-6);
+        }
+        // A square outside the blast is untouched.
+        ui.set_explosion(&[e4], 1.0);
+        assert_eq!(square_color(&ui, d5), LIGHT);
+
+        // Interaction highlights win over the blast...
+        ui.set_last_move(Some((d5, Square::D6)));
+        assert_eq!(square_color(&ui, d5), LAST_MOVE);
+        ui.select(d5, vec![Square::C6]);
+        assert_eq!(square_color(&ui, d5), SELECTED);
+        ui.clear_selection();
+        ui.set_last_move(None);
+        assert_eq!(square_color(&ui, d5), LIGHT);
+
+        // ...and clearing the blast restores the plain board colour.
+        ui.clear_explosion();
+        assert_eq!(square_color(&ui, e4), LIGHT);
     }
 }
