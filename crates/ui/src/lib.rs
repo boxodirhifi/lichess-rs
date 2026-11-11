@@ -10,8 +10,64 @@ pub struct Rect {
     pub color: [f32; 3],
 }
 
-const LIGHT: [f32; 3] = [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0];
-const DARK: [f32; 3] = [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0];
+/// Board colour themes selected by name in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardTheme {
+    /// The original Lichess-style tan board.
+    Light,
+    /// Neutral greys for OLED/low-contrast setups.
+    Dark,
+    /// Warm brown, the default.
+    #[default]
+    Brown,
+    /// Sand and walnut.
+    Wood,
+}
+
+impl BoardTheme {
+    /// Every theme, in the order the config file documents them.
+    pub const ALL: [BoardTheme; 4] = [
+        BoardTheme::Light,
+        BoardTheme::Dark,
+        BoardTheme::Brown,
+        BoardTheme::Wood,
+    ];
+
+    /// The `board = "…"` spelling in `config.toml`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            BoardTheme::Light => "light",
+            BoardTheme::Dark => "dark",
+            BoardTheme::Brown => "brown",
+            BoardTheme::Wood => "wood",
+        }
+    }
+
+    /// Parse a config value; `None` for unknown names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|theme| theme.name() == name)
+    }
+
+    /// `(light-square, dark-square)` colours, already in 0..1 floats.
+    pub const fn colors(self) -> ([f32; 3], [f32; 3]) {
+        match self {
+            BoardTheme::Light => (
+                [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0],
+                [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0],
+            ),
+            BoardTheme::Dark => ([115.0 / 255.0; 3], [64.0 / 255.0; 3]),
+            BoardTheme::Brown => (
+                [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0],
+                [115.0 / 255.0, 77.0 / 255.0, 51.0 / 255.0],
+            ),
+            BoardTheme::Wood => (
+                [209.0 / 255.0, 173.0 / 255.0, 120.0 / 255.0],
+                [140.0 / 255.0, 97.0 / 255.0, 64.0 / 255.0],
+            ),
+        }
+    }
+}
+
 const SELECTED: [f32; 3] = [106.0 / 255.0, 170.0 / 255.0, 100.0 / 255.0];
 const TARGET: [f32; 3] = [0.30, 0.55, 0.85];
 /// Muted yellow over both squares of the last played move (Lichess-style).
@@ -87,6 +143,8 @@ pub struct UI {
     pocket_truncated: [bool; 2],
     /// X position just past the last pocket element, per colour.
     pocket_end: [f32; 2],
+    /// Board palette; swapped at runtime by the config hot-reload.
+    board_theme: BoardTheme,
     /// Atomic blast squares and the current (already eased) flash strength.
     /// Blended into the base square colour only, so highlights stay on top.
     explosion: Vec<Square>,
@@ -143,6 +201,7 @@ impl UI {
         self.offset_x = offset_x;
         self.offset_y = offset_y;
 
+        let (light, _) = self.board_theme.colors();
         for r in 0..8 {
             for c in 0..8 {
                 self.squares.push(Rect {
@@ -150,7 +209,7 @@ impl UI {
                     y: offset_y + r as f32 * sq_size,
                     w: sq_size,
                     h: sq_size,
-                    color: LIGHT,
+                    color: light,
                 });
             }
         }
@@ -286,10 +345,11 @@ impl UI {
     }
 
     fn apply_colors(&mut self) {
+        let (light, dark) = self.board_theme.colors();
         for (i, rect) in self.squares.iter_mut().enumerate() {
             let row = i / 8;
             let col = i % 8;
-            let mut base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
+            let mut base = if (row + col) % 2 == 0 { light } else { dark };
             let sq = Self::square_at_index(i);
             // The blast sits directly on the board colour, below every
             // interaction highlight (which therefore never gets overridden).
@@ -358,6 +418,19 @@ impl UI {
 
     pub fn selected_pocket_piece(&self) -> Option<Role> {
         self.selected_pocket_piece
+    }
+
+    /// Switch the board palette, repainting the squares in place. Cheap enough
+    /// for a config hot-reload; a no-op when the theme is unchanged.
+    pub fn set_board_theme(&mut self, theme: BoardTheme) {
+        if self.board_theme != theme {
+            self.board_theme = theme;
+            self.apply_colors();
+        }
+    }
+
+    pub fn board_theme(&self) -> BoardTheme {
+        self.board_theme
     }
 
     /// Refresh the Atomic blast tint. `strength` is the already-eased flash
@@ -630,6 +703,8 @@ mod tests {
     fn ui_at(w: f32, h: f32) -> UI {
         let mut ui = UI::new();
         ui.layout(w, h);
+        // The colour assertions below spell out the light palette.
+        ui.set_board_theme(BoardTheme::Light);
         ui
     }
 
@@ -802,6 +877,10 @@ mod tests {
         // Ending a drag never touches the selection; the client decides.
         assert_eq!(ui.selected_square(), Some(Square::E2));
     }
+
+    /// The original palette, so the colour tests keep reading LIGHT/DARK.
+    const LIGHT: [f32; 3] = BoardTheme::Light.colors().0;
+    const DARK: [f32; 3] = BoardTheme::Light.colors().1;
 
     fn square_color(ui: &UI, sq: Square) -> [f32; 3] {
         let idx = (7 - sq.rank().to_u32() as usize) * 8 + sq.file().to_u32() as usize;
@@ -988,5 +1067,37 @@ mod tests {
         // ...and clearing the blast restores the plain board colour.
         ui.clear_explosion();
         assert_eq!(square_color(&ui, e4), LIGHT);
+    }
+
+    #[test]
+    fn board_theme_names_round_trip_and_default_to_brown() {
+        for theme in BoardTheme::ALL {
+            assert_eq!(BoardTheme::from_name(theme.name()), Some(theme));
+        }
+        assert_eq!(BoardTheme::from_name("purple"), None);
+        assert_eq!(BoardTheme::default(), BoardTheme::Brown);
+        assert_eq!(UI::new().board_theme(), BoardTheme::Brown);
+    }
+
+    #[test]
+    fn every_board_theme_paints_its_two_colours() {
+        for theme in BoardTheme::ALL {
+            let mut ui = ui_at(800.0, 600.0);
+            ui.set_board_theme(theme);
+            let (light, dark) = theme.colors();
+            // E4 is a light square, A1 a dark one; the board repaints in place.
+            assert_eq!(square_color(&ui, Square::E4), light, "{} light", theme.name());
+            assert_eq!(square_color(&ui, Square::A1), dark, "{} dark", theme.name());
+        }
+
+        // The documented palettes, so a config value can never drift silently.
+        assert_eq!(BoardTheme::Light.colors().0, [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0]);
+        assert_eq!(BoardTheme::Light.colors().1, [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0]);
+        assert_eq!(BoardTheme::Dark.colors().0, [115.0 / 255.0; 3]);
+        assert_eq!(BoardTheme::Dark.colors().1, [64.0 / 255.0; 3]);
+        assert_eq!(BoardTheme::Brown.colors().0, [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0]);
+        assert_eq!(BoardTheme::Brown.colors().1, [115.0 / 255.0, 77.0 / 255.0, 51.0 / 255.0]);
+        assert_eq!(BoardTheme::Wood.colors().0, [209.0 / 255.0, 173.0 / 255.0, 120.0 / 255.0]);
+        assert_eq!(BoardTheme::Wood.colors().1, [140.0 / 255.0, 97.0 / 255.0, 64.0 / 255.0]);
     }
 }

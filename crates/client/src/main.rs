@@ -14,8 +14,11 @@ use shakmaty::variant::{
 use shakmaty::{
     CastlingMode, Chess, Color, KnownOutcome, Move, Outcome, Position, Role, Square,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod config;
 
 #[derive(Debug, Clone)]
 pub enum NetEvent {
@@ -65,6 +68,8 @@ pub enum NetEvent {
     OnlineFailed {
         message: String,
     },
+    /// `config.toml` changed on disk (watcher thread); reload and repaint.
+    ConfigChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +137,11 @@ struct App {
     history: Vec<String>,
     /// Transient Atomic blast; `None` when idle and in every other variant.
     explosion: Option<Explosion>,
+    /// Active theme selection (board palette + SVG piece set).
+    config: config::Config,
+    /// Where the loaded config came from; `None` in tests and when neither
+    /// XDG_CONFIG_HOME nor HOME is set (hot-reload is then unavailable).
+    config_path: Option<PathBuf>,
 }
 
 /// Map a Lichess TV channel key to its shakmaty variant. `Variant::from_ascii`
@@ -516,17 +526,17 @@ struct PlayerBar {
 }
 
 /// Coordinates are tinted with the opposite colour of the square they sit on,
-/// so they always contrast — the same trick Lichess and Chess.com use.
-const COORD_ON_LIGHT: [f32; 4] = [181.0 / 255.0, 136.0 / 255.0, 99.0 / 255.0, 1.0];
-const COORD_ON_DARK: [f32; 4] = [240.0 / 255.0, 217.0 / 255.0, 181.0 / 255.0, 1.0];
-
-fn coord_color(file: u8, rank: u8) -> [f32; 4] {
+/// so they always contrast — the same trick Lichess and Chess.com use. The
+/// tints follow the active [`ui::BoardTheme`], so every palette stays legible.
+fn coord_color(theme: ui::BoardTheme, file: u8, rank: u8) -> [f32; 4] {
+    let (light, dark) = theme.colors();
     // a1 is dark; a square is light when file + rank is odd.
-    if (file as u32 + rank as u32) % 2 == 1 {
-        COORD_ON_LIGHT
+    let c = if (file as u32 + rank as u32) % 2 == 1 {
+        dark
     } else {
-        COORD_ON_DARK
-    }
+        light
+    };
+    [c[0], c[1], c[2], 1.0]
 }
 
 impl App {
@@ -998,7 +1008,7 @@ impl App {
                 x: sq_x + pad,
                 y: sq_y + sq - pad,
                 size,
-                color: coord_color(file, 0),
+                color: coord_color(self.config.board, file, 0),
                 align: renderer::TextAlign::Left,
                 shadow: false,
             });
@@ -1013,7 +1023,7 @@ impl App {
                 x: sq_x + sq - pad,
                 y: sq_y + pad + size,
                 size,
-                color: coord_color(7, rank),
+                color: coord_color(self.config.board, 7, rank),
                 align: renderer::TextAlign::Right,
                 shadow: false,
             });
@@ -1177,6 +1187,21 @@ impl App {
     fn clear_explosion(&mut self) {
         self.explosion = None;
         self.ui.clear_explosion();
+    }
+
+    /// Adopt a freshly loaded config: retint the board, re-rasterize the piece
+    /// atlas when the set changed, and remember the selection. Everything is
+    /// conditional so a save that only touches one key does the minimum work.
+    fn apply_config(&mut self, config: config::Config) {
+        if config.board != self.config.board {
+            self.ui.set_board_theme(config.board);
+        }
+        if config.pieces != self.config.pieces {
+            if let Some(rend) = self.renderer.as_mut() {
+                rend.reload_pieces(config.pieces.name());
+            }
+        }
+        self.config = config;
     }
 
     fn handle_board_click(&mut self, x: f32, y: f32) {
@@ -1376,8 +1401,12 @@ impl ApplicationHandler<NetEvent> for App {
         let size = window.inner_size();
         let safe_w = size.width.max(1) as f32;
         let safe_h = size.height.max(1) as f32;
+        self.ui.set_board_theme(self.config.board);
         self.ui.layout(safe_w, safe_h);
-        let rend = pollster::block_on(renderer::Renderer::new(window.clone()));
+        let rend = pollster::block_on(renderer::Renderer::new(
+            window.clone(),
+            self.config.pieces,
+        ));
         self.window = Some(window);
         self.renderer = Some(rend);
 
@@ -1524,6 +1553,26 @@ impl ApplicationHandler<NetEvent> for App {
             NetEvent::OnlineFailed { message } => {
                 self.online_error = Some(message);
                 self.online = Online::Idle;
+            }
+            NetEvent::ConfigChanged => {
+                let Some(path) = self.config_path.clone() else {
+                    return;
+                };
+                match config::Config::load(&path) {
+                    Ok(Some(config)) => {
+                        self.apply_config(config);
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                    }
+                    // A deleted file means "back to the defaults" is equally
+                    // defensible, but keeping the running theme is the least
+                    // surprising thing to do while the user is editing.
+                    Ok(None) => {
+                        log::warn!("{} disappeared; keeping the current theme", path.display());
+                    }
+                    Err(e) => log::warn!("Config reload ignored: {e}"),
+                }
             }
         }
 
@@ -1873,6 +1922,49 @@ fn lichess_worker(proxy: EventLoopProxy<NetEvent>) {
     }
 }
 
+/// Blocking config watcher: `notify` delivers filesystem events on its own
+/// thread; this thread forwards them to the event loop. No polling, no async
+/// runtime, and nothing runs again until the next event — idle CPU stays at 0.
+fn config_watcher(proxy: EventLoopProxy<NetEvent>, dir: PathBuf) {
+    use notify::{RecursiveMode, Watcher};
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Watch the directory, not the file: editors save by writing a temp file
+    // and renaming it over `config.toml`, which would drop a file watch.
+    let mut watcher = match notify::recommended_watcher(
+        move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result {
+                let touches_config = event
+                    .paths
+                    .iter()
+                    .any(|path| path.file_name().is_some_and(|name| name == "config.toml"));
+                // Some backends report a directory rename without a path.
+                if touches_config || event.paths.is_empty() {
+                    let _ = tx.send(());
+                }
+            }
+        },
+    ) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            log::warn!("Config hot-reload unavailable: {e}");
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+        log::warn!("Could not watch {}: {e}", dir.display());
+        return;
+    }
+    log::info!("Watching {} for theme changes", dir.display());
+
+    // One save can emit several events; coalesce the burst into one reload.
+    while rx.recv().is_ok() {
+        while rx.recv_timeout(Duration::from_millis(120)).is_ok() {}
+        let _ = proxy.send_event(NetEvent::ConfigChanged);
+    }
+    drop(watcher);
+}
+
 /// Opponent name: the `LICHESS_OPPONENT` environment variable first, then
 /// the first line of `~/.config/lichess-rs/opponent`.
 fn read_opponent() -> Option<String> {
@@ -1882,11 +1974,7 @@ fn read_opponent() -> Option<String> {
             return Some(name);
         }
     }
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|dir| !dir.is_empty())
-        .or_else(|| std::env::var("HOME").ok().map(|home| format!("{home}/.config")))?;
-    let file = format!("{config_home}/lichess-rs/opponent");
+    let file = config::config_dir()?.join("opponent");
     std::fs::read_to_string(file)
         .ok()
         .and_then(|contents| contents.lines().next().map(|line| line.trim().to_string()))
@@ -2002,8 +2090,44 @@ fn main() {
     env_logger::init();
     let event_loop = EventLoop::<NetEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+
+    // Optional theme config. Missing or malformed falls back to the defaults,
+    // and the directory is created so the watcher can see the first save even
+    // before the file exists.
+    let config_path = config::config_path();
+    let config = match config_path.as_deref() {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    log::warn!("Could not create {}: {e}", dir.display());
+                }
+            }
+            match config::Config::load(path) {
+                Ok(Some(config)) => {
+                    log::info!("Theme loaded from {}", path.display());
+                    config
+                }
+                Ok(None) => {
+                    log::info!("No {}; using the default theme", path.display());
+                    config::Config::default()
+                }
+                Err(e) => {
+                    log::warn!("{e}; using the default theme");
+                    config::Config::default()
+                }
+            }
+        }
+        None => config::Config::default(),
+    };
+
     let app_proxy = proxy.clone();
+    let watch_proxy = proxy.clone();
     std::thread::spawn(move || lichess_worker(proxy));
+    // Blocking watcher thread (same pattern as the TV worker): no polling.
+    if let Some(dir) = config_path.as_deref().and_then(|path| path.parent()) {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || config_watcher(watch_proxy, dir));
+    }
 
     let mut app = App {
         proxy: Some(app_proxy),
@@ -2022,6 +2146,8 @@ fn main() {
         online_error: None,
         history: Vec::new(),
         explosion: None,
+        config,
+        config_path,
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -2049,6 +2175,8 @@ mod tests {
             online_error: None,
             history: Vec::new(),
             explosion: None,
+            config: config::Config::default(),
+            config_path: None,
         };
         app.ui.layout(800.0, 600.0);
         app
@@ -3026,10 +3154,33 @@ mod tests {
     fn coordinates_contrast_with_their_square() {
         let app = app_with_live_game();
         let texts = app.build_texts();
-        // a1 is a dark square, so its file letter must use the light tint.
-        assert_eq!(text_named(&texts, "a").color, COORD_ON_DARK);
+        let (light, dark) = ui::BoardTheme::Brown.colors();
+        // a1 is a dark square, so its file letter uses the light tint.
+        assert_eq!(text_named(&texts, "a").color, [light[0], light[1], light[2], 1.0]);
         // b1 is light, so its letter uses the dark tint.
-        assert_eq!(text_named(&texts, "b").color, COORD_ON_LIGHT);
+        assert_eq!(text_named(&texts, "b").color, [dark[0], dark[1], dark[2], 1.0]);
+    }
+
+    #[test]
+    fn switching_the_config_retints_the_board_and_coordinates() {
+        let mut app = app_with_live_game();
+        assert_eq!(app.config, config::Config::default());
+        assert_eq!(app.ui.board_theme(), ui::BoardTheme::Brown);
+
+        app.apply_config(config::Config {
+            board: ui::BoardTheme::Wood,
+            pieces: renderer::PieceSet::Leipzig,
+        });
+
+        assert_eq!(app.config.board, ui::BoardTheme::Wood);
+        assert_eq!(app.ui.board_theme(), ui::BoardTheme::Wood);
+        // No renderer in unit tests, so the piece swap is only recorded.
+        assert_eq!(app.config.pieces, renderer::PieceSet::Leipzig);
+
+        let texts = app.build_texts();
+        let (light, dark) = ui::BoardTheme::Wood.colors();
+        assert_eq!(text_named(&texts, "a").color, [light[0], light[1], light[2], 1.0]);
+        assert_eq!(text_named(&texts, "b").color, [dark[0], dark[1], dark[2], 1.0]);
     }
 
     #[test]

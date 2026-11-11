@@ -7,7 +7,7 @@ use shakmaty::{Color, Role, Square};
 mod piece_pipeline;
 mod quad_pipeline;
 mod text_pipeline;
-pub use piece_pipeline::rasterize_piece;
+pub use piece_pipeline::{rasterize_piece, PieceSet};
 pub use quad_pipeline::Quad;
 pub use text_pipeline::{TextAlign, TextElement};
 use piece_pipeline::PiecePipeline;
@@ -67,7 +67,9 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    /// Build the renderer with `pieces` as the initial SVG set; config
+    /// hot-reload swaps it later through [`Renderer::reload_pieces`].
+    pub async fn new(window: Arc<Window>, pieces: PieceSet) -> Self {
         let size = window.inner_size();
         let safe_width = size.width.max(1);
         let safe_height = size.height.max(1);
@@ -108,9 +110,16 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let quad_pipeline = QuadPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
-        // SVG piece atlas: 12 cburnett SVGs rasterized here, on the main
-        // thread, in milliseconds.
-        let piece_pipeline = PiecePipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
+        // SVG piece atlas: 12 SVGs of the configured set rasterized here, on
+        // the main thread, in milliseconds.
+        let piece_pipeline = PiecePipeline::new(
+            &device,
+            &queue,
+            surface_format,
+            safe_width as f32,
+            safe_height as f32,
+            pieces,
+        );
         let text_pipeline = TextPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
 
         Self { surface, device, queue, config, window, quad_pipeline, piece_pipeline, text_pipeline }
@@ -125,6 +134,16 @@ impl Renderer {
             self.piece_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
             self.text_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
         }
+    }
+
+    /// Swap the SVG piece set at runtime and re-rasterize the atlas. Returns
+    /// `false` (keeping the current set) for unknown names or raster failures.
+    pub fn reload_pieces(&mut self, set_name: &str) -> bool {
+        let Some(set) = PieceSet::from_name(set_name) else {
+            log::warn!("Unknown piece set {set_name:?}; keeping the current one");
+            return false;
+        };
+        self.piece_pipeline.reload(&self.queue, set)
     }
 
     /// Width in pixels of `text` at `size`, using the same glyph advances as

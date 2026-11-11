@@ -1,7 +1,8 @@
-//! Piece rendering: the cburnett SVG set rasterized once at init into a
-//! GPU texture atlas, drawn as textured quads. Replaces the old glyph-based
-//! piece path (no tint, no stamped outline — the SVG carries its own colors
-//! and contrast).
+//! Piece rendering: one bundled SVG set rasterized into a GPU texture atlas,
+//! drawn as textured quads. Replaces the old glyph-based piece path (no tint,
+//! no stamped outline — the SVG carries its own colors and contrast). The set
+//! is selectable at runtime (`PieceSet`), so a config hot-reload re-rasterizes
+//! the same atlas texture in place.
 
 use shakmaty::{Color, Position, Role};
 use wgpu::util::DeviceExt;
@@ -42,30 +43,83 @@ fn piece_index(role: Role, color: Color) -> usize {
     }
 }
 
-/// The embedded cburnett SVG for a piece, selected by (role, color).
-fn piece_svg(role: Role, color: Color) -> &'static str {
-    match (color, role) {
-        (Color::White, Role::King) => include_str!("../assets/cburnett/wK.svg"),
-        (Color::White, Role::Queen) => include_str!("../assets/cburnett/wQ.svg"),
-        (Color::White, Role::Rook) => include_str!("../assets/cburnett/wR.svg"),
-        (Color::White, Role::Bishop) => include_str!("../assets/cburnett/wB.svg"),
-        (Color::White, Role::Knight) => include_str!("../assets/cburnett/wN.svg"),
-        (Color::White, Role::Pawn) => include_str!("../assets/cburnett/wP.svg"),
-        (Color::Black, Role::King) => include_str!("../assets/cburnett/bK.svg"),
-        (Color::Black, Role::Queen) => include_str!("../assets/cburnett/bQ.svg"),
-        (Color::Black, Role::Rook) => include_str!("../assets/cburnett/bR.svg"),
-        (Color::Black, Role::Bishop) => include_str!("../assets/cburnett/bB.svg"),
-        (Color::Black, Role::Knight) => include_str!("../assets/cburnett/bN.svg"),
-        (Color::Black, Role::Pawn) => include_str!("../assets/cburnett/bP.svg"),
+/// Bundled SVG piece sets. Every directory under `assets/` holds the same
+/// twelve files (`wK.svg` … `bP.svg`), so a set swap reuses the atlas layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PieceSet {
+    #[default]
+    Cburnett,
+    Merida,
+    Alpha,
+    Leipzig,
+}
+
+impl PieceSet {
+    /// Every bundled set, in the order the config file documents them.
+    pub const ALL: [PieceSet; 4] = [
+        PieceSet::Cburnett,
+        PieceSet::Merida,
+        PieceSet::Alpha,
+        PieceSet::Leipzig,
+    ];
+
+    /// The `pieces = "…"` spelling in `config.toml`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            PieceSet::Cburnett => "cburnett",
+            PieceSet::Merida => "merida",
+            PieceSet::Alpha => "alpha",
+            PieceSet::Leipzig => "leipzig",
+        }
+    }
+
+    /// Parse a config value; `None` for unknown names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|set| set.name() == name)
+    }
+
+    /// The embedded SVG for one piece.
+    fn svg(self, role: Role, color: Color) -> &'static str {
+        macro_rules! set {
+            ($dir:literal) => {
+                match (color, role) {
+                    (Color::White, Role::King) => include_str!(concat!("../assets/", $dir, "/wK.svg")),
+                    (Color::White, Role::Queen) => include_str!(concat!("../assets/", $dir, "/wQ.svg")),
+                    (Color::White, Role::Rook) => include_str!(concat!("../assets/", $dir, "/wR.svg")),
+                    (Color::White, Role::Bishop) => include_str!(concat!("../assets/", $dir, "/wB.svg")),
+                    (Color::White, Role::Knight) => include_str!(concat!("../assets/", $dir, "/wN.svg")),
+                    (Color::White, Role::Pawn) => include_str!(concat!("../assets/", $dir, "/wP.svg")),
+                    (Color::Black, Role::King) => include_str!(concat!("../assets/", $dir, "/bK.svg")),
+                    (Color::Black, Role::Queen) => include_str!(concat!("../assets/", $dir, "/bQ.svg")),
+                    (Color::Black, Role::Rook) => include_str!(concat!("../assets/", $dir, "/bR.svg")),
+                    (Color::Black, Role::Bishop) => include_str!(concat!("../assets/", $dir, "/bB.svg")),
+                    (Color::Black, Role::Knight) => include_str!(concat!("../assets/", $dir, "/bN.svg")),
+                    (Color::Black, Role::Pawn) => include_str!(concat!("../assets/", $dir, "/bP.svg")),
+                }
+            };
+        }
+        match self {
+            PieceSet::Cburnett => set!("cburnett"),
+            PieceSet::Merida => set!("merida"),
+            PieceSet::Alpha => set!("alpha"),
+            PieceSet::Leipzig => set!("leipzig"),
+        }
     }
 }
 
 /// Rasterize one piece SVG to straight-alpha RGBA8 bytes (PIECE_RASTER²).
-/// Pure CPU work, a few milliseconds for all twelve — done once at init.
-pub fn rasterize_piece(role: Role, color: Color) -> Result<Vec<u8>, String> {
-    let svg = piece_svg(role, color);
+/// Pure CPU work, a few milliseconds for all twelve.
+pub fn rasterize_piece(role: Role, color: Color, set: PieceSet) -> Result<Vec<u8>, String> {
+    let svg = set.svg(role, color);
     let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default())
-        .map_err(|e| format!("{}{} svg parse failed: {e}", color_name(color), role_name(role)))?;
+        .map_err(|e| {
+            format!(
+                "{} {}{} svg parse failed: {e}",
+                set.name(),
+                color_name(color),
+                role_name(role)
+            )
+        })?;
 
     let size = tree.size();
     let sx = PIECE_RASTER as f32 / size.width();
@@ -111,11 +165,66 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
+/// Rasterize one whole set into the 4×3 straight-alpha RGBA atlas.
+fn piece_atlas(set: PieceSet) -> Result<Vec<u8>, String> {
+    let (width, height) = atlas_size();
+    let mut atlas = vec![0u8; (width * height * 4) as usize];
+    for idx in 0..(ATLAS_COLS * ATLAS_ROWS) as usize {
+        let role = match idx % 6 {
+            0 => Role::Pawn,
+            1 => Role::Knight,
+            2 => Role::Bishop,
+            3 => Role::Rook,
+            4 => Role::Queen,
+            _ => Role::King,
+        };
+        let color = if idx < 6 { Color::White } else { Color::Black };
+        let pixels = rasterize_piece(role, color, set)?;
+        let col = (idx as u32 % ATLAS_COLS) * PIECE_RASTER;
+        let row = (idx as u32 / ATLAS_COLS) * PIECE_RASTER;
+        for y in 0..PIECE_RASTER {
+            let src = (y * PIECE_RASTER * 4) as usize;
+            let dst = ((row + y) * width + col) as usize * 4;
+            atlas[dst..dst + (PIECE_RASTER * 4) as usize]
+                .copy_from_slice(&pixels[src..src + (PIECE_RASTER * 4) as usize]);
+        }
+    }
+    Ok(atlas)
+}
+
+/// Pixel size of the piece atlas.
+fn atlas_size() -> (u32, u32) {
+    (ATLAS_COLS * PIECE_RASTER, ATLAS_ROWS * PIECE_RASTER)
+}
+
+/// Upload `atlas` into `texture`; a full rewrite, which is what a set swap
+/// does and what the initial upload does.
+fn write_atlas(queue: &wgpu::Queue, texture: &wgpu::Texture, atlas: &[u8]) {
+    let (width, height) = atlas_size();
+    queue.write_texture(
+        texture.as_image_copy(),
+        atlas,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 pub struct PiecePipeline {
     render_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
+    /// Kept so `reload` can rewrite the same texture in place (the bind group
+    /// and view stay valid).
+    atlas_texture: wgpu::Texture,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     vertices: Vec<PieceVertex>,
@@ -123,37 +232,23 @@ pub struct PiecePipeline {
 }
 
 impl PiecePipeline {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, width: f32, height: f32) -> Self {
-        // Rasterize all 12 pieces and pack them into one atlas.
-        let atlas_size = (ATLAS_COLS * PIECE_RASTER, ATLAS_ROWS * PIECE_RASTER);
-        let mut atlas = vec![0u8; (atlas_size.0 * atlas_size.1 * 4) as usize];
-        for idx in 0..(ATLAS_COLS * ATLAS_ROWS) as usize {
-            let role = match idx % 6 {
-                0 => Role::Pawn,
-                1 => Role::Knight,
-                2 => Role::Bishop,
-                3 => Role::Rook,
-                4 => Role::Queen,
-                _ => Role::King,
-            };
-            let color = if idx < 6 { Color::White } else { Color::Black };
-            let pixels = rasterize_piece(role, color)
-                .unwrap_or_else(|e| panic!("piece rasterization failed: {e}"));
-            let col = (idx as u32 % ATLAS_COLS) * PIECE_RASTER;
-            let row = (idx as u32 / ATLAS_COLS) * PIECE_RASTER;
-            for y in 0..PIECE_RASTER {
-                let src = (y * PIECE_RASTER * 4) as usize;
-                let dst = ((row + y) * atlas_size.0 + col) as usize * 4;
-                atlas[dst..dst + (PIECE_RASTER * 4) as usize]
-                    .copy_from_slice(&pixels[src..src + (PIECE_RASTER * 4) as usize]);
-            }
-        }
-
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        width: f32,
+        height: f32,
+        set: PieceSet,
+    ) -> Self {
+        // Rasterize all 12 pieces of the selected set into one atlas.
+        let atlas = piece_atlas(set)
+            .unwrap_or_else(|e| panic!("piece rasterization failed: {e}"));
+        let (atlas_w, atlas_h) = atlas_size();
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("piece_atlas"),
             size: wgpu::Extent3d {
-                width: atlas_size.0,
-                height: atlas_size.1,
+                width: atlas_w,
+                height: atlas_h,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -163,20 +258,7 @@ impl PiecePipeline {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            atlas_texture.as_image_copy(),
-            &atlas,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas_size.0 * 4),
-                rows_per_image: Some(atlas_size.1),
-            },
-            wgpu::Extent3d {
-                width: atlas_size.0,
-                height: atlas_size.1,
-                depth_or_array_layers: 1,
-            },
-        );
+        write_atlas(queue, &atlas_texture, &atlas);
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -342,6 +424,7 @@ impl PiecePipeline {
             camera_buffer,
             camera_bind_group,
             atlas_bind_group,
+            atlas_texture,
             vertex_buffer,
             index_buffer,
             vertices: Vec::with_capacity((MAX_QUADS * 4) as usize),
@@ -355,6 +438,22 @@ impl PiecePipeline {
         let projection = glam::Mat4::orthographic_rh(0.0, width, height, 0.0, -1.0, 1.0);
         let cam = CameraUniforms { view_proj: projection.to_cols_array_2d() };
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[cam]));
+    }
+
+    /// Re-rasterize `set` into the existing atlas texture (config hot-reload).
+    /// Returns `false` and keeps the current pieces on failure.
+    pub fn reload(&mut self, queue: &wgpu::Queue, set: PieceSet) -> bool {
+        match piece_atlas(set) {
+            Ok(atlas) => {
+                write_atlas(queue, &self.atlas_texture, &atlas);
+                log::info!("Piece set switched to {}", set.name());
+                true
+            }
+            Err(e) => {
+                log::error!("Could not load piece set {}: {e}", set.name());
+                false
+            }
+        }
     }
 
     /// Upload the whole piece scene (board pieces + extras such as the
@@ -454,23 +553,48 @@ impl PiecePipeline {
 mod tests {
     use super::*;
 
-    /// All 12 piece SVGs must load, rasterize, and produce a visibly non-empty
-    /// silhouette at the raster size.
+    /// Every bundled set exposes the documented name, and unknown names fail.
     #[test]
-    fn all_twelve_pieces_rasterize() {
-        for role in [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen, Role::King] {
-            for color in [Color::White, Color::Black] {
-                let pixels = rasterize_piece(role, color)
-                    .unwrap_or_else(|e| panic!("{}{} failed: {e}", color_name(color), role_name(role)));
-                assert_eq!(pixels.len(), (PIECE_RASTER * PIECE_RASTER * 4) as usize);
-                let opaque = pixels.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
-                // A piece silhouette fills well over 5% of its cell.
-                assert!(
-                    opaque as f32 > 0.05 * (PIECE_RASTER * PIECE_RASTER) as f32,
-                    "{:?} {:?} silhouette too small: {} px",
-                    color, role, opaque
-                );
+    fn piece_set_names_round_trip() {
+        for set in PieceSet::ALL {
+            assert_eq!(PieceSet::from_name(set.name()), Some(set));
+        }
+        assert_eq!(PieceSet::from_name("nostalgic"), None);
+        assert_eq!(PieceSet::default(), PieceSet::Cburnett);
+    }
+
+    /// All 12 piece SVGs of every set must load, rasterize, and produce a
+    /// visibly non-empty silhouette at the raster size.
+    #[test]
+    fn every_set_rasterizes_its_twelve_pieces() {
+        for set in PieceSet::ALL {
+            for role in [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen, Role::King] {
+                for color in [Color::White, Color::Black] {
+                    let pixels = rasterize_piece(role, color, set).unwrap_or_else(|e| {
+                        panic!("{} {}{} failed: {e}", set.name(), color_name(color), role_name(role))
+                    });
+                    assert_eq!(pixels.len(), (PIECE_RASTER * PIECE_RASTER * 4) as usize);
+                    let opaque = pixels.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
+                    // A piece silhouette fills well over 5% of its cell.
+                    assert!(
+                        opaque as f32 > 0.05 * (PIECE_RASTER * PIECE_RASTER) as f32,
+                        "{} {:?} {:?} silhouette too small: {} px",
+                        set.name(), color, role, opaque
+                    );
+                }
             }
+        }
+    }
+
+    /// A whole set packs into a full 4×3 atlas without holes.
+    #[test]
+    fn every_set_builds_a_full_atlas() {
+        let (w, h) = atlas_size();
+        for set in PieceSet::ALL {
+            let atlas = piece_atlas(set).unwrap_or_else(|e| panic!("{} atlas failed: {e}", set.name()));
+            assert_eq!(atlas.len(), (w * h * 4) as usize);
+            let opaque = atlas.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
+            assert!(opaque > 0, "{} atlas is empty", set.name());
         }
     }
 

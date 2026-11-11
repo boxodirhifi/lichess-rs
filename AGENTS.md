@@ -24,7 +24,7 @@ Workspace crates (post-migration):
 | Crate | Responsibility |
 |---|---|
 | `client` | The binary. Event loop, app state, wires everything together. |
-| `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text), SVG piece atlas (cburnett set). |
+| `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text), SVG piece atlas (four bundled sets). |
 | `ui` | Layout & interaction geometry: squares, selection, move targets, promotion menu, coordinates. |
 | `platform` | Window creation & Wayland/X11 integration via `winit`. |
 | `lichess` | REST (`ureq`) + real-time NDJSON streaming. Returns plain data (FEN/SAN strings, player info). Never touches `shakmaty` or rendering. |
@@ -71,15 +71,15 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    end of `window_event` — that caused a 100%-CPU unbounded loop before.
 4. **Clocks trust the server.** Display exact `wc`/`bc` values; freeze via
    `LiveGameInfo.game_over` when the game ends. No client-side interpolation.
-5. **Pieces are real SVG piece sets (cburnett), not glyphs.** The 12 cburnett
-   SVGs are bundled under `crates/renderer/assets/cburnett/` (`include_str!`) and
-   rasterized once at renderer init with pure-Rust `resvg` (no fonts needed:
-   `default-features = false`), packed into one `Rgba8UnormSrgb` texture atlas
-   (4×3 cells of 256 px), and drawn through `PiecePipeline` as straight-alpha
-   blended textured quads — no tint, no stamped outline; the SVG carries the
-   colors. Board pieces and promotion-menu pieces share this path
-   (`PieceElement.role/color` index the atlas). The `ab_glyph` pipeline stays
-   for text only (coordinates, names, clocks, banner).
+5. **Pieces are real SVG piece sets, not glyphs.** The 12 SVGs of each bundled
+   set live under `crates/renderer/assets/<set>/` (`include_str!`) and are
+   rasterized with pure-Rust `resvg` (no fonts needed: `default-features = false`),
+   packed into one `Rgba8UnormSrgb` texture atlas (4×3 cells of 256 px), and
+   drawn through `PiecePipeline` as straight-alpha blended textured quads — no
+   tint, no stamped outline; the SVG carries the colors. Board pieces and
+   promotion-menu pieces share this path (`PieceElement.role/color` index the
+   atlas). The `ab_glyph` pipeline stays for text only (coordinates, names,
+   clocks, banner). The set is runtime-swappable (decision 13).
 6. **Coordinates are in-square, Lichess-style:** files `a–h` bottom-left of rank-1
    squares, ranks `1–8` top-right of h-file squares, tinted with the opposite color
    of their square. Board = 80% of the min window dimension. No outer gutter.
@@ -150,6 +150,24 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    redraw path and keeps `needs_redraw` true while the effect lives, then the loop
    drops back to `Wait` (no timer, no idle work). Mode switches and new featured
    games clear the blast; other variants never set it.
+13. **Theming is one optional TOML file, hot-reloaded by a blocking watcher.**
+   `~/.config/lichess-rs/config.toml` (`$XDG_CONFIG_HOME` honoured, directory
+   created at startup) holds `[theme] board = "…"` and `pieces = "…"`. Missing →
+   defaults (`brown`, `cburnett`); malformed or unknown names → warn and keep the
+   running selection (startup falls back to the defaults). `ui::BoardTheme` owns
+   the four palettes (`light`, `dark`, `brown`, `wood`) and `apply_colors` reads
+   them, so every square tint, selection, explosion blend and coordinate colour
+   (the opposite-square tint, now theme-aware in the client) follows along.
+   `renderer::PieceSet` owns the four bundled sets; `Renderer::reload_pieces`
+   re-rasterizes the set into the **same** atlas texture in place, so the bind
+   group and view stay valid and no pipeline is rebuilt. A `notify` watcher runs
+   on its own `std::thread` (same pattern as the TV worker) watching the config
+   *directory* — editors save via rename, which would kill a file watch — filters
+   events to `config.toml`, coalesces a 120 ms burst, and sends
+   `NetEvent::ConfigChanged` through the `EventLoopProxy`. The event loop reloads
+   the file, applies only what changed, and requests one redraw; the thread then
+   blocks in `mpsc::recv` again, so idle CPU stays at zero and there is no
+   polling timer anywhere.
 
 ## Coding Conventions
 
@@ -170,7 +188,8 @@ App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `Esc` = cl
 promotion menu. Pieces move by click-click or drag-and-drop (press a piece, drag to
 a legal target, release); a press/release without moving stays a plain click. In
 Crazyhouse, clicking a pocket piece highlights its legal drops (click one, or drag
-the piece out and release there); dimmed pocket rows are display-only.
+the piece out and release there); dimmed pocket rows are display-only. Theming is
+driven by `~/.config/lichess-rs/config.toml` and applies live on save.
 
 ## Roadmap
 
@@ -198,6 +217,10 @@ Completed:
   blast radius for 500 ms (ease-out, under the interaction highlights) and fade the
   pieces shakmaty actually removes (the destination faster, 200 ms); drives Local,
   Live and Play, cleared on mode/game switches and absent in every other variant
+- [x] **Phase C — Theming**: optional `~/.config/lichess-rs/config.toml`
+  (`[theme] board`, `[theme] pieces`), four board palettes with theme-aware
+  coordinates, four bundled SVG sets (`cburnett`, `merida`, `alpha`, `leipzig`),
+  and a blocking `notify` watcher that hot-reloads both while the app runs
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -224,7 +247,6 @@ Next:
   swap from "echo the server" latency smoothing.
 - [ ] Variant *play* beyond Crazyhouse drops (Atomic, Horde, three-check, …) —
   spectate-only today.
-- [ ] Theming — and only then `notify` for hot-reload
 
 ## Migration Spec: shakmaty (execute in order, one commit per stage)
 
