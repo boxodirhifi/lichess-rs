@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod config;
+mod permissions;
 
 #[derive(Debug, Clone)]
 pub enum NetEvent {
@@ -546,6 +547,17 @@ impl App {
     fn start_online_challenge(&mut self) {
         if !matches!(self.online, Online::Idle) {
             return;
+        }
+        // The auth flow owns the token file: create an empty owner-only file if
+        // it is missing, so the user has a 0600 place to paste the token.
+        // Existing files are never rewritten or chmod'ed, only checked.
+        if let Some(path) = config::token_path() {
+            match permissions::ensure_private_empty_file(&path) {
+                Ok(true) => log::info!("Created {} for the API token", path.display()),
+                Ok(false) => {}
+                Err(e) => log::warn!("Could not create {}: {e}", path.display()),
+            }
+            permissions::warn_if_shared_readable(&path, "API token");
         }
         let Some(token) = lichess::read_token() else {
             self.online_error = Some(
@@ -1558,6 +1570,9 @@ impl ApplicationHandler<NetEvent> for App {
                 let Some(path) = self.config_path.clone() else {
                     return;
                 };
+                // Editors sometimes save through a temp file and reset the
+                // mode, so re-check on every reload and never auto-fix it.
+                permissions::warn_if_shared_readable(&path, "config file");
                 match config::Config::load(&path) {
                     Ok(Some(config)) => {
                         self.apply_config(config);
@@ -2091,17 +2106,25 @@ fn main() {
     let event_loop = EventLoop::<NetEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
 
-    // Optional theme config. Missing or malformed falls back to the defaults,
-    // and the directory is created so the watcher can see the first save even
-    // before the file exists.
+    // Theme config: the directory is created owner-only (0700), and a missing
+    // config is written 0600 from the documented defaults. Both are watched for
+    // hot-reload; malformed files fall back to the defaults.
     let config_path = config::config_path();
+    let token_path = config::token_path();
     let config = match config_path.as_deref() {
         Some(path) => {
             if let Some(dir) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(dir) {
+                if let Err(e) = permissions::create_private_dir(dir) {
                     log::warn!("Could not create {}: {e}", dir.display());
                 }
             }
+            match config::ensure_config_file(path) {
+                Ok(true) => log::info!("Created default config at {}", path.display()),
+                Ok(false) => {}
+                Err(e) => log::warn!("{e}"),
+            }
+            // Never chmod a file the user already had: warn instead.
+            permissions::warn_if_shared_readable(path, "config file");
             match config::Config::load(path) {
                 Ok(Some(config)) => {
                     log::info!("Theme loaded from {}", path.display());
@@ -2119,6 +2142,9 @@ fn main() {
         }
         None => config::Config::default(),
     };
+    if let Some(path) = token_path.as_deref() {
+        permissions::warn_if_shared_readable(path, "API token");
+    }
 
     let app_proxy = proxy.clone();
     let watch_proxy = proxy.clone();

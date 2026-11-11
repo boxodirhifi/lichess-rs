@@ -152,8 +152,9 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    games clear the blast; other variants never set it.
 13. **Theming is one optional TOML file, hot-reloaded by a blocking watcher.**
    `~/.config/lichess-rs/config.toml` (`$XDG_CONFIG_HOME` honoured, directory
-   created at startup) holds `[theme] board = "…"` and `pieces = "…"`. Missing →
-   defaults (`brown`, `cburnett`); malformed or unknown names → warn and keep the
+   created 0700 at startup) holds `[theme] board = "…"` and `pieces = "…"`. A
+   missing file is created 0600 from the documented defaults (`brown`,
+   `cburnett`; decision 14); malformed or unknown names → warn and keep the
    running selection (startup falls back to the defaults). `ui::BoardTheme` owns
    the four palettes (`light`, `dark`, `brown`, `wood`) and `apply_colors` reads
    them, so every square tint, selection, explosion blend and coordinate colour
@@ -168,6 +169,18 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    the file, applies only what changed, and requests one redraw; the thread then
    blocks in `mpsc::recv` again, so idle CPU stays at zero and there is no
    polling timer anywhere.
+14. **Secrets and config are owner-only; shared permissions are warned about,
+   never auto-fixed.** The client creates `~/.config/lichess-rs/` with mode 0700,
+   and writes the empty token placeholder (from the auth flow) and the default
+   `config.toml` through `permissions::write_private_file`, which opens with 0600
+   and then re-applies the mode with `set_permissions` (the open mode is filtered
+   through the umask, and a pre-existing file keeps its old bits). Existing files
+   are the user's: startup and every `ConfigChanged` call
+   `permissions::warn_if_shared_readable`, which warns when
+   `mode & 0o044 != 0` (group- or world-readable) and suggests `chmod 600`.
+   Non-Unix platforms skip the POSIX bits with a debug log — Windows uses ACLs,
+   not modes. No new dependencies: `std::fs` plus `std::os::unix::fs::PermissionsExt`
+   behind `#[cfg(unix)]`.
 
 ## Coding Conventions
 
@@ -190,6 +203,9 @@ a legal target, release); a press/release without moving stays a plain click. In
 Crazyhouse, clicking a pocket piece highlights its legal drops (click one, or drag
 the piece out and release there); dimmed pocket rows are display-only. Theming is
 driven by `~/.config/lichess-rs/config.toml` and applies live on save.
+`~/.config/lichess-rs/` is created 0700, the token and config files are written
+0600, and the app warns (without auto-fixing) if either file is group- or
+world-readable.
 
 ## Roadmap
 
@@ -221,6 +237,10 @@ Completed:
   (`[theme] board`, `[theme] pieces`), four board palettes with theme-aware
   coordinates, four bundled SVG sets (`cburnett`, `merida`, `alpha`, `leipzig`),
   and a blocking `notify` watcher that hot-reloads both while the app runs
+- [x] **Security hardening — owner-only token/config permissions**: the config
+  directory is created 0700; the token placeholder and default config are 0600
+  (Unix); startup and hot-reload warn when either file is group/world-readable
+  (`mode & 0o044`), never auto-fixing the user's mode
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move

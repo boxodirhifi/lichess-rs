@@ -1,9 +1,10 @@
 //! User configuration: `~/.config/lichess-rs/config.toml` (or
 //! `$XDG_CONFIG_HOME/lichess-rs/config.toml`).
 //!
-//! The file is optional. A missing file means defaults; a malformed one is
-//! reported to the caller so startup can warn and fall back, and a hot-reload
-//! can warn and keep the running config. The format is:
+//! The file is optional. A missing file is created from [`DEFAULT_TOML`] on
+//! first run; a malformed one is reported to the caller so startup can warn and
+//! fall back, and a hot-reload can warn and keep the running config. The format
+//! is:
 //!
 //! ```toml
 //! [theme]
@@ -18,6 +19,15 @@ use serde::Deserialize;
 
 use renderer::PieceSet;
 use ui::BoardTheme;
+
+use crate::permissions;
+
+/// Starter file written on first run; comments document every accepted value.
+pub const DEFAULT_TOML: &str = "\
+[theme]
+board = \"brown\"      # light, dark, brown, wood
+pieces = \"cburnett\"  # cburnett, merida, alpha, leipzig
+";
 
 /// The effective theme selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +118,23 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("config.toml"))
 }
 
+/// The Board API token path (`None` when neither XDG nor HOME is set).
+pub fn token_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("token"))
+}
+
+/// Write a commented default config to `path` with owner-only permissions when
+/// it does not exist yet. Returns `true` if the file was created and `false`
+/// when it already existed (existing files are never rewritten or chmod'ed).
+pub fn ensure_config_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    permissions::write_private_file(path, DEFAULT_TOML)
+        .with_context(|| format!("writing default config to {}", path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +199,36 @@ mod tests {
     fn a_missing_file_is_not_an_error() {
         let path = std::env::temp_dir().join("lichess-rs-does-not-exist/config.toml");
         assert_eq!(Config::load(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn the_default_template_parses_to_the_defaults() {
+        assert_eq!(Config::from_toml(DEFAULT_TOML).unwrap(), Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_config_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lichess-rs-config-mode-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        assert!(ensure_config_file(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(Config::load(&path).unwrap(), Some(Config::default()));
+
+        // A second run leaves the user's file untouched.
+        std::fs::write(&path, "[theme]\nboard = \"wood\"\n").unwrap();
+        assert!(!ensure_config_file(&path).unwrap());
+        assert_eq!(Config::load(&path).unwrap().unwrap().board, BoardTheme::Wood);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
