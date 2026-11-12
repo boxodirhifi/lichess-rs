@@ -928,6 +928,11 @@ impl App {
             log::warn!("Online move was not echoed by the server; rolled back");
         }
         if game_over {
+            // The stream declares the end: nothing may still be played, so
+            // the terminal frame must not leave a promotion menu behind that
+            // could fire a move into a finished game.
+            self.ui.close_promotion();
+            self.ui.clear_selection();
             let previous = std::mem::replace(&mut self.online, OnlineState::Idle);
             if let OnlineState::Active(game) = previous {
                 self.online = OnlineState::Finished(game);
@@ -1728,6 +1733,12 @@ impl App {
             None => (None, None),
         };
         if self.mode == Mode::Local {
+            // A finished local game (or 50-move draw) keeps its final board
+            // frozen: no further move is accepted into it, including a
+            // promotion picked with the menu still open.
+            if self.local_game_over() {
+                return;
+            }
             self.board.play_unchecked(mv);
             self.side = self.board.turn();
             self.refresh_check_highlight();
@@ -1739,6 +1750,13 @@ impl App {
             if self.token.is_none() {
                 self.online_notice = Some("No API token - cannot play that move".to_string());
                 return;
+            }
+            // Online play is accepted only while the game is still active;
+            // a finished or failed board stays exactly as the terminal
+            // position left it.
+            match &self.online {
+                OnlineState::Active(game) if !game.game_over => {}
+                _ => return,
             }
             // Optimistic apply: the board advances now and the move is marked
             // pending until the server echoes it (or a rollback arrives).
@@ -4572,6 +4590,72 @@ mod tests {
         app.on_online_full(online_full());
         app.token = Some(lichess::Token::new("s3cret"));
         app
+    }
+
+    #[test]
+    fn a_terminal_game_state_closes_the_promotion_menu() {
+        let mut app = app_in_online_game();
+        // A promotion menu can be open when the terminal state arrives
+        // (the click landed just before the game ended on the server).
+        app.ui.open_promotion(Square::E7, Square::E8, Color::White);
+        assert!(app.ui.promotion_open());
+
+        app.on_online_state(online_state("", "resigned", Some("white")));
+
+        assert!(!app.ui.promotion_open(), "the menu must not outlive the game");
+        assert!(app.ui.selected_square().is_none());
+        assert!(matches!(app.online, OnlineState::Finished(_)));
+    }
+
+    #[test]
+    fn promotion_does_not_play_into_a_finished_online_game() {
+        let mut app = app_in_online_game();
+        {
+            let game = app.online.active_mut().unwrap();
+            let promo = position_from_fen("standard", "8/4P3/8/8/8/8/8/4K2k w - - 0 1")
+                .expect("promotion fen");
+            game.board = promo.clone();
+            game.server_board = promo;
+            game.game_over = true; // as if the terminal state had arrived
+        }
+        app.ui.open_promotion(Square::E7, Square::E8, Color::White);
+
+        app.finish_promotion(Role::Queen);
+
+        let board = app.online_game().expect("game").board.board();
+        assert!(
+            board.piece_at(Square::E7).is_some(),
+            "the pawn is not moved by a finished game"
+        );
+        assert!(
+            board.piece_at(Square::E8).is_none(),
+            "no queen lands on the terminal board"
+        );
+        assert!(app.history.is_empty());
+        assert!(app.online_notice.is_none());
+        assert!(!app.ui.promotion_open());
+    }
+
+    #[test]
+    fn local_moves_stop_when_the_game_is_over() {
+        // A mate whatever how it is reached, nothing may follow.
+        let mut app = app_from_fen("r1bqk1nr/pppp1Qpp/2n5/2b1p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4");
+        assert!(app.local_game_over());
+        assert!(app.board.board().piece_at(Square::E1).is_some());
+
+        // A move that would be legal on a living board must be rejected by
+        // the end guard (e.g. a promotion picked with the menu still open).
+        let probe = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let blocked = find_move(&probe.board, Square::E2, Square::E4);
+        let before = app.board.board().occupied();
+        app.apply_move(blocked);
+
+        assert_eq!(
+            app.board.board().occupied(),
+            before,
+            "the terminal board is untouched"
+        );
+        assert!(app.history.is_empty());
     }
 
     #[test]
