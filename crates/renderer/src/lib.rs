@@ -121,8 +121,9 @@ pub struct PieceElement {
     pub y: f32,
     /// Edge length in pixels; the piece fills its square.
     pub size: f32,
-    /// Straight-alpha multiplier; 1.0 is the normal SVG opacity, pocket pieces
-    /// that cannot be dropped use ~0.5 to read as disabled.
+    /// Opacity multiplier; scales the sampled premultiplied vec4 (rgb and alpha
+    /// alike), so pocket pieces that cannot be dropped use ~0.5 to read as
+    /// disabled while the blend invariant holds everywhere it is drawn.
     pub alpha: f32,
 }
 

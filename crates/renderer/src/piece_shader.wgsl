@@ -33,9 +33,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Straight-alpha RGBA from the SVG atlas; the piece colours carry their
+    // Premultiplied RGBA from the SVG atlas; the piece colours carry their
     // own styling, no tint applied. The vertex alpha fades pocket pieces that
-    // can't be dropped.
-    let sampled = textureSample(atlas_tex, atlas_samp, in.uv);
-    return vec4<f32>(sampled.rgb, sampled.a * in.alpha);
+    // can't be dropped: scaling rgb and a together keeps the sample on the
+    // premultiplied side of the invariant the blend relies on.
+    return textureSample(atlas_tex, atlas_samp, in.uv) * in.alpha;
 }

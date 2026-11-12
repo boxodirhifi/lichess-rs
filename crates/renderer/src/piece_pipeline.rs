@@ -107,7 +107,7 @@ impl PieceSet {
     }
 }
 
-/// Rasterize one piece SVG to straight-alpha RGBA8 bytes (PIECE_RASTER²).
+/// Rasterize one piece SVG to premultiplied RGBA8 bytes (PIECE_RASTER²).
 /// Pure CPU work, a few milliseconds for all twelve.
 pub fn rasterize_piece(role: Role, color: Color, set: PieceSet) -> Result<Vec<u8>, String> {
     let svg = set.svg(role, color);
@@ -129,21 +129,11 @@ pub fn rasterize_piece(role: Role, color: Color, set: PieceSet) -> Result<Vec<u8
         .ok_or_else(|| format!("{}{} raster alloc failed", color_name(color), role_name(role)))?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
 
-    // tiny-skia hands us premultiplied sRGBA; the blend we sample with
-    // expects straight alpha, so demultiply before upload (private color
-    // types make it easier over the raw bytes). Premultiplied components
-    // never exceed alpha, so the checked division always lands.
-    for px in pixmap.data_mut().as_chunks_mut::<4>().0.iter_mut() {
-        let a = px[3] as u32;
-        for c in px[..3].iter_mut() {
-            *c = (*c as u32)
-                .checked_mul(255)
-                .and_then(|v| v.checked_add(a / 2))
-                .and_then(|v| v.checked_div(a))
-                .map(|v| v.min(255))
-                .unwrap_or(255) as u8;
-        }
-    }
+    // tiny-skia hands us premultiplied sRGBA and the piece shader blends with
+    // One / OneMinusSrcAlpha, so the bytes are uploaded exactly as the
+    // rasterizer produced them. Demultiplying first is what creates the white
+    // fringe along piece edges: dividing by a tiny alpha amplifies rounding
+    // noise into a visible bright outline.
     Ok(pixmap.data().to_vec())
 }
 
@@ -165,7 +155,7 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-/// Rasterize one whole set into the 4×3 straight-alpha RGBA atlas.
+/// Rasterize one whole set into the 4×3 premultiplied RGBA atlas.
 fn piece_atlas(set: PieceSet) -> Result<Vec<u8>, String> {
     let (width, height) = atlas_size();
     let mut atlas = vec![0u8; (width * height * 4) as usize];
@@ -370,9 +360,13 @@ impl PiecePipeline {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
+                    // Premultiplied-alpha blending: the atlas texture is
+                    // stored premultiplied, and the shader's vertex alpha fades
+                    // scale the whole sampled vec4, so the invariant rgb <= a
+                    // survives composition.
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            src_factor: wgpu::BlendFactor::One,
                             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                             operation: wgpu::BlendOperation::Add,
                         },
@@ -574,6 +568,10 @@ mod tests {
                         panic!("{} {}{} failed: {e}", set.name(), color_name(color), role_name(role))
                     });
                     assert_eq!(pixels.len(), (PIECE_RASTER * PIECE_RASTER * 4) as usize);
+                    // Premultiplied invariant: rgb never exceeds alpha.
+                    assert!(pixels.as_chunks::<4>().0.iter().all(|p| {
+                        p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]
+                    }), "{} {:?} {:?} is not premultiplied", set.name(), color, role);
                     let opaque = pixels.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
                     // A piece silhouette fills well over 5% of its cell.
                     assert!(
