@@ -42,6 +42,10 @@ pub enum DragSource {
 
 pub struct Scene<'a> {
     pub quads: &'a [Quad],
+    /// Quads drawn after the piece pass, so modal panels (the challenge
+    /// dialog) cover the board instead of sitting underneath it. Text is
+    /// still painted last, on top of everything.
+    pub overlay_quads: &'a [Quad],
     pub board: &'a VariantPosition,
     pub board_offset: (f32, f32),
     pub square_size: f32,
@@ -62,6 +66,7 @@ pub struct Renderer {
     #[allow(dead_code)]
     window: Arc<Window>,
     quad_pipeline: QuadPipeline,
+    overlay_pipeline: QuadPipeline,
     piece_pipeline: PiecePipeline,
     text_pipeline: TextPipeline,
 }
@@ -110,6 +115,9 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let quad_pipeline = QuadPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
+        // Same geometry pipeline, drawn after pieces: modal panels must cover
+        // the board rather than being hidden behind the piece quads.
+        let overlay_pipeline = QuadPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
         // SVG piece atlas: 12 SVGs of the configured set rasterized here, on
         // the main thread, in milliseconds.
         let piece_pipeline = PiecePipeline::new(
@@ -122,7 +130,17 @@ impl Renderer {
         );
         let text_pipeline = TextPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
 
-        Self { surface, device, queue, config, window, quad_pipeline, piece_pipeline, text_pipeline }
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            window,
+            quad_pipeline,
+            overlay_pipeline,
+            piece_pipeline,
+            text_pipeline,
+        }
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -131,6 +149,7 @@ impl Renderer {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.quad_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
+            self.overlay_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
             self.piece_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
             self.text_pipeline.resize(&self.queue, new_size.width as f32, new_size.height as f32);
         }
@@ -189,6 +208,7 @@ impl Renderer {
         }
 
         self.quad_pipeline.prepare(&self.queue, scene.quads);
+        self.overlay_pipeline.prepare(&self.queue, scene.overlay_quads);
         self.piece_pipeline.prepare(
             &self.queue,
             scene.board,
@@ -220,6 +240,7 @@ impl Renderer {
             });
             self.quad_pipeline.draw(&mut pass);
             self.piece_pipeline.draw(&mut pass);
+            self.overlay_pipeline.draw(&mut pass);
             self.text_pipeline.draw(&mut pass);
         }
         self.queue.submit(std::iter::once(encoder.finish()));

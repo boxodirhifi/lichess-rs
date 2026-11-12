@@ -25,7 +25,7 @@ Workspace crates (post-migration):
 |---|---|
 | `client` | The binary. Event loop, app state, wires everything together. |
 | `renderer` | `wgpu` pipelines: quads (squares/menus), glyph atlas (text), SVG piece atlas (four bundled sets). |
-| `ui` | Layout & interaction geometry: squares, selection, move targets, promotion menu, coordinates. |
+| `ui` | Layout & interaction geometry: squares, selection, move targets, promotion menu, challenge panel, action buttons, coordinates. |
 | `platform` | Window creation & Wayland/X11 integration via `winit`. |
 | `lichess` | REST (`ureq`) + real-time NDJSON streaming. Returns plain data (FEN/SAN strings, player info). Never touches `shakmaty` or rendering. |
 | ~~`chess`~~ | **Deleted** during the shakmaty migration. Do not reintroduce. |
@@ -207,6 +207,23 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    The endpoint contract (`gameFull`/`gameState` shapes) lives on
    `lichess::api`. API tests run against a local `std::net::TcpListener`, so
    the suite stays offline and needs no mock crate.
+16. **Challenges and in-game actions are UI geometry in `ui`, HTTP in
+   `lichess`, decisions in `client`.** `C` opens a modal `ChallengePanel`
+   (opponent field, six clock presets, three colour choices, Create/Cancel)
+   owned by `ui` (layout, hit-testing, selection state) and rendered by the
+   client; typing accepts only the username alphabet (30 max), Enter submits,
+   Escape/outside clicks dismiss, and invalid input keeps the panel open with
+   a red status line (the token hint lives there too). The panel's quads use a
+   **second quad pass drawn after pieces** (`Scene.overlay_quads`), so the
+   opaque dialog covers the board instead of sitting under its pieces; while
+   it is open it also owns the whole text pass (no coordinates/bars/history
+   showing through). In an active game a Takeback / Draw / Resign row sits in
+   the bottom margin; `ui::ControlKind` hit-tests, `client::send_control`
+   posts the documented endpoint on a worker thread, and the reply is
+   optimistic (`"Draw offer sent"`) with a redacted `OnlineNotice` on failure.
+   The row exists only in `OnlineState::Active` with `!game_over`; finished,
+   failed and inactive states keep the final board but cannot send. `renderer`
+   gained only the overlay pass (same sphere pipeline, no new dependency).
 
 ## Coding Conventions
 
@@ -224,7 +241,10 @@ cargo build && cargo test && cargo run
 ```
 
 App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `C` =
-online challenge (Board API), `Esc` = close promotion menu. Pieces move by
+open the online challenge panel (Board API; type the opponent, pick a clock
+and colour, Enter to send, Esc to cancel), `Esc` = close promotion menu. An
+active online game shows Takeback / Draw / Resign buttons under the board.
+Pieces move by
 click-click or drag-and-drop (press a piece, drag to a legal target, release); a
 press/release without moving stays a plain click. In
 Crazyhouse, clicking a pocket piece highlights its legal drops (click one, or drag
@@ -273,6 +293,10 @@ Completed:
   pre-flight validation, bounded 429 backoff, typed `thiserror` errors, and the
   explicit `Idle/Challenging/WaitingAccept/Active/Finished/Failed` client enum
   (the final board stays visible after a failure but is not playable)
+- [x] **Online play Stage 2 — challenge panel + game controls**: modal
+  opponent/clock/colour panel (`C`), validated submission, an overlay quad pass
+  so the panel covers the board, and Takeback / Draw / Resign buttons wired to
+  `/api/board/game/{id}/{takeback/yes,draw/yes,resign}` with optimistic notices
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -291,10 +315,8 @@ Known limitations:
   (200 ms) and the 500 ms flash covers the capturer's disappearance.
 
 Next:
-- [ ] Online play Stage 2 — challenge panel (opponent, clock presets, colour)
-  and in-game Takeback / Draw / Resign buttons wired through the same state
-  machine. Stage 3 — optimistic move application with confirmation from the
-  stream and rollback on rejection.
+- [ ] Online play Stage 3 — optimistic move application with confirmation from
+  the stream and rollback on rejection.
 - [ ] Variant *play* beyond Crazyhouse drops (Atomic, Horde, three-check, …) —
   spectate-only today.
 

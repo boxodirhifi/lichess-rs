@@ -55,6 +55,10 @@ pub enum NetEvent {
     OnlineFailed {
         message: String,
     },
+    /// A non-fatal action result (takeback/draw offer sent, or a safe error).
+    OnlineNotice {
+        message: String,
+    },
     /// `config.toml` changed on disk (watcher thread); reload and repaint.
     ConfigChanged,
 }
@@ -159,6 +163,12 @@ struct App {
     api: lichess::ApiClient,
     my_username: Option<String>,
     online: OnlineState,
+    /// Text in the challenge panel's opponent field.
+    challenge_opponent: String,
+    /// Validation/token error shown inside the open challenge panel.
+    challenge_error: Option<String>,
+    /// Transient result of a takeback/draw/resign request.
+    online_notice: Option<String>,
     /// SAN of every move seen in the current game, oldest first. Rebuilt only
     /// from applied/derived moves; cleared on a new game or a mode switch.
     history: Vec<String>,
@@ -225,6 +235,14 @@ fn color_name(color: Color) -> &'static str {
     match color {
         Color::White => "White",
         Color::Black => "Black",
+    }
+}
+
+/// `3+2` style label for a `(limit, increment)` time control in seconds.
+fn clock_label((limit, increment): (u32, u32)) -> String {
+    match (limit % 60, limit / 60) {
+        (0, minutes) => format!("{minutes}+{increment}"),
+        _ => format!("{limit}s+{increment}"),
     }
 }
 
@@ -567,65 +585,144 @@ fn coord_color(theme: ui::BoardTheme, file: u8, rank: u8) -> [f32; 4] {
 }
 
 impl App {
-    /// Kick off the online flow: read the token and the seeded opponent, build
-    /// a validated challenge request, and hand the long-running work to a
-    /// worker thread. The state machine is `Idle → Challenging`, then the
-    /// worker reports `WaitingAccept` / `Active` / `Failed`.
-    fn start_online_challenge(&mut self) {
+    /// Open the Stage 2 challenge panel instead of starting the flow
+    /// immediately. The token file is created (0600) here so the user has a
+    /// place to paste it; a missing token is shown inside the panel, not as a
+    /// failed game, because the panel is still open for correction.
+    fn open_challenge_panel(&mut self) {
         if !self.online.is_startable() {
             return;
         }
         // The auth flow owns the token file: create an empty owner-only file if
         // it is missing, so the user has a 0600 place to paste the token.
-        // Existing files are never rewritten or chmod'ed, only checked.
-        if let Some(path) = config::token_path() {
-            match permissions::ensure_private_empty_file(&path) {
-                Ok(true) => log::info!("Created {} for the API token", path.display()),
-                Ok(false) => {}
-                Err(e) => log::warn!("Could not create {}: {e}", path.display()),
+        // Existing files are never rewritten or chmod'ed, only checked. Unit
+        // tests have no event loop (`proxy` is `None`) and never touch the
+        // user's config directory.
+        if self.proxy.is_some() {
+            if let Some(path) = config::token_path() {
+                match permissions::ensure_private_empty_file(&path) {
+                    Ok(true) => log::info!("Created {} for the API token", path.display()),
+                    Ok(false) => {}
+                    Err(e) => log::warn!("Could not create {}: {e}", path.display()),
+                }
+                permissions::warn_if_shared_readable(&path, "API token");
             }
-            permissions::warn_if_shared_readable(&path, "API token");
         }
-        let Some(token) = lichess::read_token() else {
-            self.online = OnlineState::Failed {
-                message: "No API token — set LICHESS_API_TOKEN or ~/.config/lichess-rs/token"
-                    .to_string(),
-                game: None,
-            };
-            return;
+        self.mode = Mode::Play;
+        self.ui.clear_selection();
+        self.ui.clear_promotion();
+        self.ui.set_last_move(None);
+        self.history.clear();
+        self.clear_explosion();
+        self.online_notice = None;
+        self.challenge_error = if lichess::read_token().is_some() {
+            None
+        } else {
+            Some("No API token — set it in ~/.config/lichess-rs/token".to_string())
         };
-        let Some(opponent) = read_opponent() else {
-            self.online = OnlineState::Failed {
-                message: "No opponent — set LICHESS_OPPONENT or ~/.config/lichess-rs/opponent"
-                    .to_string(),
-                game: None,
-            };
-            return;
+        if self.challenge_opponent.is_empty() {
+            if let Some(name) = read_opponent() {
+                self.challenge_opponent = name;
+            }
+        }
+        self.ui.open_challenge();
+    }
+
+    /// Build a validated challenge from the panel's current selections. Split
+    /// from submission so the validation is testable without a worker.
+    fn panel_challenge_request(&self) -> Result<lichess::ChallengeRequest, String> {
+        let opponent = self.challenge_opponent.trim();
+        lichess::validate_username(opponent).map_err(|e| e.to_string())?;
+        let (limit, increment) = self.ui.challenge_clock();
+        let color = match self.ui.challenge_color_index() {
+            0 => lichess::ChallengeColor::White,
+            1 => lichess::ChallengeColor::Black,
+            _ => lichess::ChallengeColor::Random,
         };
-        // Stage 2 replaces these defaults with the challenge panel.
-        let request = match lichess::ChallengeRequest::new(
-            opponent,
-            false,
-            180,
-            2,
-            lichess::ChallengeColor::Random,
-        ) {
+        lichess::ChallengeRequest::new(opponent, false, limit, increment, color)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Validate the panel, read the token, close the panel and hand the
+    /// long-running work (challenge keep-alive + game stream) to a worker.
+    /// The state machine is `Idle → Challenging`, then the worker reports
+    /// `WaitingAccept` / `Active` / `Failed`.
+    fn submit_challenge(&mut self) {
+        if !self.online.is_startable() {
+            return;
+        }
+        let request = match self.panel_challenge_request() {
             Ok(request) => request,
-            Err(e) => {
-                self.online = OnlineState::Failed {
-                    message: format!("Invalid challenge: {e}"),
-                    game: None,
-                };
+            Err(message) => {
+                self.challenge_error = Some(message);
                 return;
             }
         };
+        // A test can seed `self.token`; production always reads the file/env.
+        let Some(token) = self.token.clone().or_else(lichess::read_token) else {
+            self.challenge_error =
+                Some("No API token — set it in ~/.config/lichess-rs/token".to_string());
+            return;
+        };
         self.token = Some(token.clone());
+        self.challenge_error = None;
+        self.online_notice = None;
+        self.ui.close_challenge();
+        self.ui.clear_selection();
         self.online = OnlineState::Challenging;
         let Some(proxy) = self.proxy.clone() else {
             return;
         };
         let api = self.api.clone();
         std::thread::spawn(move || online_worker(proxy, api, token, request));
+    }
+
+    /// Keyboard input while the challenge panel is open. Only the opponent
+    /// field edits text; Enter submits, Escape closes. Returns whether the
+    /// frame needs repainting.
+    fn handle_challenge_key(&mut self, code: KeyCode, text: Option<&str>) -> bool {
+        match code {
+            KeyCode::Escape => {
+                self.ui.close_challenge();
+                true
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                self.submit_challenge();
+                true
+            }
+            KeyCode::Backspace => {
+                self.challenge_opponent.pop();
+                true
+            }
+            _ => {
+                let Some(text) = text else {
+                    return false;
+                };
+                let mut changed = false;
+                for c in text.chars() {
+                    if self.challenge_opponent.chars().count() >= 30 {
+                        break;
+                    }
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        self.challenge_opponent.push(c);
+                        changed = true;
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    /// Mouse input while the challenge panel is open. A click outside the
+    /// panel (or Cancel) closes it; the typed opponent is kept for next time.
+    fn handle_challenge_click(&mut self, x: f32, y: f32) {
+        match self.ui.challenge_hit(x, y) {
+            Some(ui::ChallengeHit::Clock(index)) => self.ui.select_challenge_clock(index),
+            Some(ui::ChallengeHit::Color(index)) => self.ui.select_challenge_color(index),
+            Some(ui::ChallengeHit::Create) => self.submit_challenge(),
+            Some(ui::ChallengeHit::Cancel) | None => self.ui.close_challenge(),
+            Some(ui::ChallengeHit::Opponent) | Some(ui::ChallengeHit::Inside) => {}
+        }
     }
 
     /// `OnlineChallengeCreated`: the challenge exists, so only the opponent's
@@ -655,9 +752,11 @@ impl App {
             fen => position_from_fen("standard", fen).unwrap_or_default(),
         };
         replay_uci(&mut board, &full.state.moves);
-        // A fresh online game starts without a last-move highlight.
+        // A fresh online game starts without a last-move highlight or notices.
         self.ui.set_last_move(None);
         self.history.clear();
+        self.online_notice = None;
+        self.challenge_error = None;
         let game_over = full.state.status != "started";
         let game = Box::new(OnlineGame {
             game_id: full.id,
@@ -737,6 +836,7 @@ impl App {
             None => message,
         };
         log::warn!("Online play failed: {message}");
+        self.online_notice = None;
         self.online = OnlineState::Failed { message, game };
     }
 
@@ -789,12 +889,156 @@ impl App {
     }
 
     fn build_texts(&self) -> Vec<renderer::TextElement> {
+        // The challenge panel is modal: drawing the board's coordinates,
+        // bars or history through it would look broken, so it owns the whole
+        // text pass while open.
+        if self.ui.challenge_open() {
+            return self.challenge_texts();
+        }
         let mut texts = Vec::new();
         self.push_coordinates(&mut texts);
         self.push_player_bars(&mut texts);
         self.push_pocket_badges(&mut texts);
         self.push_move_history(&mut texts);
+        self.push_control_texts(&mut texts);
         texts
+    }
+
+    /// Text for the challenge dialog, positioned from `ui`'s geometry. The
+    /// panel quads draw over the board; this text draws over the quads.
+    fn challenge_texts(&self) -> Vec<renderer::TextElement> {
+        let mut texts = Vec::new();
+        let Some(panel) = self.ui.challenge_panel() else {
+            return texts;
+        };
+        let white = [0.96, 0.96, 0.96, 1.0];
+        let muted = [0.66, 0.66, 0.69, 1.0];
+        let error = [0.97, 0.55, 0.48, 1.0];
+        let base = (panel.panel.w * 0.036).clamp(12.0, 17.0);
+        let title_size = (panel.panel.w * 0.055).clamp(16.0, 24.0);
+        let centered = |rect: &ui::Rect| rect.y + rect.h * 0.5 + base * 0.35;
+        let left = panel.opponent.x;
+
+        texts.push(renderer::TextElement {
+            text: "New challenge".to_string(),
+            x: left,
+            y: panel.opponent.y - title_size * 0.9,
+            size: title_size,
+            color: white,
+            align: renderer::TextAlign::Left,
+            shadow: false,
+        });
+
+        let opponent = self.challenge_opponent.trim();
+        texts.push(renderer::TextElement {
+            text: if opponent.is_empty() {
+                "Opponent username".to_string()
+            } else {
+                opponent.to_string()
+            },
+            x: left + panel.opponent.h * 0.35,
+            y: centered(&panel.opponent),
+            size: base,
+            color: if opponent.is_empty() { muted } else { white },
+            align: renderer::TextAlign::Left,
+            shadow: false,
+        });
+        // Field label, drawn small above the input.
+        texts.push(renderer::TextElement {
+            text: "Opponent".to_string(),
+            x: left,
+            y: panel.opponent.y - base * 0.45,
+            size: base * 0.8,
+            color: muted,
+            align: renderer::TextAlign::Left,
+            shadow: false,
+        });
+
+        for (i, rect) in panel.clocks.iter().enumerate() {
+            texts.push(renderer::TextElement {
+                text: clock_label(ui::CHALLENGE_CLOCKS[i]),
+                x: rect.x + rect.w * 0.5,
+                y: centered(rect),
+                size: base,
+                color: white,
+                align: renderer::TextAlign::Center,
+                shadow: false,
+            });
+        }
+        for (i, rect) in panel.colors.iter().enumerate() {
+            texts.push(renderer::TextElement {
+                text: ui::CHALLENGE_COLORS[i].to_string(),
+                x: rect.x + rect.w * 0.5,
+                y: centered(rect),
+                size: base,
+                color: white,
+                align: renderer::TextAlign::Center,
+                shadow: false,
+            });
+        }
+        for (rect, label) in [(panel.cancel, "Cancel"), (panel.create, "Create")] {
+            texts.push(renderer::TextElement {
+                text: label.to_string(),
+                x: rect.x + rect.w * 0.5,
+                y: centered(&rect),
+                size: base,
+                color: white,
+                align: renderer::TextAlign::Center,
+                shadow: false,
+            });
+        }
+
+        let (status, color) = match &self.challenge_error {
+            Some(message) => (message.as_str(), error),
+            None => ("Unrated · Enter to send · Esc to cancel", muted),
+        };
+        texts.push(renderer::TextElement {
+            text: status.to_string(),
+            x: panel.status.x,
+            y: centered(&panel.status),
+            size: base * 0.85,
+            color,
+            align: renderer::TextAlign::Left,
+            shadow: false,
+        });
+        texts
+    }
+
+    /// Labels for the Takeback / Draw / Resign row and the last action notice.
+    fn push_control_texts(&self, out: &mut Vec<renderer::TextElement>) {
+        if self.mode != Mode::Play {
+            return;
+        }
+        let controls = self.ui.controls();
+        for button in controls {
+            let label = match button.kind {
+                ui::ControlKind::Takeback => "Takeback",
+                ui::ControlKind::Draw => "Draw",
+                ui::ControlKind::Resign => "Resign",
+            };
+            let size = (button.rect.h * 0.42).clamp(10.0, 16.0);
+            out.push(renderer::TextElement {
+                text: label.to_string(),
+                x: button.rect.x + button.rect.w * 0.5,
+                y: button.rect.y + button.rect.h * 0.5 + size * 0.35,
+                size,
+                color: [0.96, 0.96, 0.96, 1.0],
+                align: renderer::TextAlign::Center,
+                shadow: false,
+            });
+        }
+        if let (Some(notice), Some(first)) = (&self.online_notice, controls.first()) {
+            let size = (first.rect.h * 0.36).clamp(10.0, 14.0);
+            out.push(renderer::TextElement {
+                text: notice.clone(),
+                x: self.ui.board_offset().0 + self.ui.square_size() * 8.0,
+                y: first.rect.y + first.rect.h * 0.5 + size * 0.35,
+                size,
+                color: [0.85, 0.85, 0.82, 1.0],
+                align: renderer::TextAlign::Right,
+                shadow: false,
+            });
+        }
     }
 
     /// The two player bars (black above the board, white below) for the mode
@@ -1239,6 +1483,56 @@ impl App {
         self.online.game()
     }
 
+    /// Show the Takeback / Draw / Resign row only while a Board API game is
+    /// running and movable; a finished or failed game keeps the final board
+    /// but has nothing to send.
+    fn sync_controls(&mut self) {
+        let visible = self.mode == Mode::Play
+            && matches!(&self.online, OnlineState::Active(game) if !game.game_over);
+        self.ui.set_controls_visible(visible);
+    }
+
+    /// Send a takeback/draw offer or a resignation. The notice is optimistic
+    /// ("… sent"); the game stream reports the real outcome, and a transport
+    /// failure replaces the notice with a redacted message.
+    fn send_control(&mut self, kind: ui::ControlKind) {
+        let Some(game) = self.online_game() else { return };
+        if !matches!(self.online, OnlineState::Active(_)) {
+            return;
+        }
+        let game_id = game.game_id.clone();
+        let Some(token) = self.token.clone() else {
+            self.online_notice = Some("No API token — cannot send that".to_string());
+            return;
+        };
+        let api = self.api.clone();
+        self.online_notice = Some(
+            match kind {
+                ui::ControlKind::Takeback => "Takeback offer sent",
+                ui::ControlKind::Draw => "Draw offer sent",
+                ui::ControlKind::Resign => "Resigning…",
+            }
+            .to_string(),
+        );
+        // Unit tests have no event loop; the optimistic notice above is the
+        // observable part there, and no request leaves the process.
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let result = match kind {
+                ui::ControlKind::Takeback => api.takeback(&token, &game_id),
+                ui::ControlKind::Draw => api.offer_draw(&token, &game_id),
+                ui::ControlKind::Resign => api.resign(&token, &game_id),
+            };
+            if let Err(e) = result {
+                let message = safe_error("Online control failed", e, &token);
+                log::warn!("{message}");
+                let _ = proxy.send_event(NetEvent::OnlineNotice { message });
+            }
+        });
+    }
+
     fn finish_promotion(&mut self, role: Role) {
         let Some((from, to, _)) = self.ui.close_promotion() else {
             return;
@@ -1526,6 +1820,18 @@ impl App {
     /// move (clicking a highlighted target) clears the selection and so never
     /// starts a drag.
     fn handle_mouse_press(&mut self, x: f32, y: f32) {
+        // The challenge panel is modal: it swallows the press so no piece
+        // behind it can be selected or dragged.
+        if self.ui.challenge_open() {
+            self.handle_challenge_click(x, y);
+            return;
+        }
+        // Action buttons sit in the bottom margin, off the board; a press on
+        // one sends the request instead of starting a board interaction.
+        if let Some(kind) = self.ui.control_at(x, y) {
+            self.send_control(kind);
+            return;
+        }
         self.handle_board_click(x, y);
         if self.mode == Mode::Live {
             return;
@@ -1561,6 +1867,12 @@ impl App {
     /// else clears the selection. A press/release without movement stays a
     /// plain click and keeps the selection.
     fn handle_mouse_release(&mut self, x: f32, y: f32) -> bool {
+        // A panel opened mid-drag (keyboard shortcut) ends the drag without
+        // resolving it into a move behind the dialog.
+        if self.ui.challenge_open() {
+            self.ui.end_drag();
+            return false;
+        }
         if !self.ui.is_dragging() {
             return false;
         }
@@ -1662,6 +1974,16 @@ impl ApplicationHandler<NetEvent> for App {
             NetEvent::OnlineFull(full) => self.on_online_full(*full),
             NetEvent::OnlineState(state) => self.on_online_state(state),
             NetEvent::OnlineFailed { message } => self.on_online_failed(message),
+            NetEvent::OnlineNotice { message } => {
+                // Worker messages are already redacted; re-apply locally so a
+                // future caller cannot leak the token into the notice line.
+                let message = match &self.token {
+                    Some(token) => lichess::redact(&message, token.as_str()),
+                    None => message,
+                };
+                log::info!("Online notice: {message}");
+                self.online_notice = Some(message);
+            }
             NetEvent::ConfigChanged => {
                 let Some(path) = self.config_path.clone() else {
                     return;
@@ -1732,7 +2054,10 @@ impl ApplicationHandler<NetEvent> for App {
                 // Dragging needs a redraw on every move (the piece follows the
                 // cursor); promotion hover is the other cursor-driven visual.
                 let dragging = self.handle_cursor_moved(position.x as f32, position.y as f32);
-                needs_redraw = dragging || self.ui.promotion_open();
+                needs_redraw = dragging
+                    || self.ui.promotion_open()
+                    || self.ui.challenge_open()
+                    || !self.ui.controls().is_empty();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let (x, y) = self.cursor_pos;
@@ -1747,45 +2072,49 @@ impl ApplicationHandler<NetEvent> for App {
                 event: KeyEvent {
                     physical_key: PhysicalKey::Code(code),
                     state: ElementState::Pressed,
+                    text,
                     ..
                 },
                 ..
             } => {
-                match code {
-                    KeyCode::KeyL => {
-                        self.mode = Mode::Live;
-                        self.ui.clear_selection();
-                        self.ui.clear_promotion();
-                        self.ui.set_checked_king(None);
-                        self.ui.set_last_move(None);
-                        self.history.clear();
-                        self.clear_explosion();
-                        needs_redraw = true;
+                // While the challenge panel is open every key belongs to the
+                // opponent field (or submits/cancels); global shortcuts such
+                // as `L`/`P`/`C` must not fire mid-edit.
+                if self.ui.challenge_open() {
+                    needs_redraw = self.handle_challenge_key(code, text.as_deref());
+                } else {
+                    match code {
+                        KeyCode::KeyL => {
+                            self.mode = Mode::Live;
+                            self.ui.clear_selection();
+                            self.ui.clear_promotion();
+                            self.ui.set_checked_king(None);
+                            self.ui.set_last_move(None);
+                            self.history.clear();
+                            self.clear_explosion();
+                            self.online_notice = None;
+                            needs_redraw = true;
+                        }
+                        KeyCode::KeyP => {
+                            self.mode = Mode::Local;
+                            self.ui.clear_selection();
+                            self.refresh_check_highlight();
+                            self.ui.set_last_move(None);
+                            self.history.clear();
+                            self.clear_explosion();
+                            self.online_notice = None;
+                            needs_redraw = true;
+                        }
+                        KeyCode::KeyC => {
+                            self.open_challenge_panel();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Escape => {
+                            self.ui.close_promotion();
+                            needs_redraw = true;
+                        }
+                        _ => {}
                     }
-                    KeyCode::KeyP => {
-                        self.mode = Mode::Local;
-                        self.ui.clear_selection();
-                        self.refresh_check_highlight();
-                        self.ui.set_last_move(None);
-                        self.history.clear();
-                        self.clear_explosion();
-                        needs_redraw = true;
-                    }
-                    KeyCode::KeyC => {
-                        self.mode = Mode::Play;
-                        self.ui.clear_selection();
-                        self.ui.clear_promotion();
-                        self.ui.set_last_move(None);
-                        self.history.clear();
-                        self.clear_explosion();
-                        self.start_online_challenge();
-                        needs_redraw = true;
-                    }
-                    KeyCode::Escape => {
-                        self.ui.close_promotion();
-                        needs_redraw = true;
-                    }
-                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1794,6 +2123,8 @@ impl ApplicationHandler<NetEvent> for App {
                 let explosion_age = self.tick_explosion();
                 // Derive the pocket rows before anything reads them for layout.
                 self.sync_pockets();
+                // The action row only exists while an active online game runs.
+                self.sync_controls();
                 let texts = self.build_texts();
                 let cursor = Some((self.cursor_pos.0 as f32, self.cursor_pos.1 as f32));
                 let mut quads: Vec<renderer::Quad> = self.ui.squares.iter().map(|r| {
@@ -1802,6 +2133,23 @@ impl ApplicationHandler<NetEvent> for App {
 
                 for r in self.ui.promotion_quads(cursor) {
                     quads.push(renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color });
+                }
+                // Action buttons and the modal challenge panel draw after the
+                // piece pass, so they cover the board instead of being hidden.
+                let mut overlay_quads: Vec<renderer::Quad> = self
+                    .ui
+                    .control_quads(cursor)
+                    .into_iter()
+                    .map(|r| renderer::Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: r.color })
+                    .collect();
+                for r in self.ui.challenge_quads(cursor) {
+                    overlay_quads.push(renderer::Quad {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                        color: r.color,
+                    });
                 }
                 // Selection tint behind the chosen pocket piece; quads draw
                 // under the piece pass, so it reads as a highlight.
@@ -1934,6 +2282,7 @@ impl ApplicationHandler<NetEvent> for App {
                 if let Some(rend) = self.renderer.as_mut() {
                     let scene = renderer::Scene {
                         quads: &quads,
+                        overlay_quads: &overlay_quads,
                         board,
                         board_offset: self.ui.board_offset(),
                         square_size: self.ui.square_size(),
@@ -2295,6 +2644,9 @@ fn main() {
         api: lichess::ApiClient::new(),
         my_username: None,
         online: OnlineState::Idle,
+        challenge_opponent: String::new(),
+        challenge_error: None,
+        online_notice: None,
         history: Vec::new(),
         explosion: None,
         config,
@@ -2324,6 +2676,9 @@ mod tests {
             api: lichess::ApiClient::new(),
             my_username: None,
             online: OnlineState::Idle,
+            challenge_opponent: String::new(),
+            challenge_error: None,
+            online_notice: None,
             history: Vec::new(),
             explosion: None,
             config: config::Config::default(),
@@ -3653,8 +4008,159 @@ mod tests {
     }
 
     #[test]
-    fn local_play_has_no_player_bars() {
-        let app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    fn the_challenge_panel_opens_in_play_and_keeps_the_typed_opponent() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.challenge_opponent = "bob".to_string();
+        app.open_challenge_panel();
+        assert_eq!(app.mode, Mode::Play);
+        assert!(app.ui.challenge_open());
+        assert_eq!(app.challenge_opponent, "bob");
+        // Pressing C during a live game must not replace its board with the
+        // challenge panel.
+        let mut active = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        active.mode = Mode::Play;
+        active.my_username = Some("me".to_string());
+        active.on_online_full(online_full());
+        active.open_challenge_panel();
+        assert!(!active.ui.challenge_open());
+        assert!(matches!(active.online, OnlineState::Active(_)));
+    }
+
+    #[test]
+    fn challenge_panel_validation_and_selections_reach_the_request() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.challenge_opponent.clear();
+        assert!(app.panel_challenge_request().is_err());
+
+        app.challenge_opponent = "bad name".to_string();
+        assert!(app.panel_challenge_request().is_err());
+
+        app.challenge_opponent = "  bob  ".to_string();
+        app.ui.select_challenge_clock(2);
+        app.ui.select_challenge_color(1);
+        let request = app.panel_challenge_request().expect("valid request");
+        assert_eq!(request.username(), "bob");
+        assert_eq!(request.clock_limit(), 180);
+        assert_eq!(request.clock_increment(), 2);
+        assert_eq!(request.color(), lichess::ChallengeColor::Black);
+        assert!(!request.rated());
+    }
+
+    #[test]
+    fn challenge_keys_edit_the_opponent_field_and_cancel() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.open_challenge_panel();
+        app.challenge_opponent.clear();
+
+        assert!(app.handle_challenge_key(KeyCode::KeyB, Some("b")));
+        assert!(app.handle_challenge_key(KeyCode::KeyO, Some("o")));
+        assert_eq!(app.challenge_opponent, "bo");
+
+        // Spaces, punctuation and non-ASCII are refused; `_` and `-` are not.
+        assert!(app.handle_challenge_key(KeyCode::Space, Some(" !ü-")));
+        assert_eq!(app.challenge_opponent, "bo-");
+
+        assert!(app.handle_challenge_key(KeyCode::Backspace, None));
+        assert_eq!(app.challenge_opponent, "bo");
+
+        app.challenge_opponent = "a".repeat(30);
+        assert!(!app.handle_challenge_key(KeyCode::KeyB, Some("b")));
+        assert_eq!(app.challenge_opponent.len(), 30);
+
+        assert!(app.handle_challenge_key(KeyCode::Escape, None));
+        assert!(!app.ui.challenge_open());
+        // The text survives closing and reopening.
+        app.open_challenge_panel();
+        assert_eq!(app.challenge_opponent.len(), 30);
+    }
+
+    #[test]
+    fn submitting_a_challenge_validates_before_changing_state() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.open_challenge_panel();
+        app.challenge_opponent = "x".to_string();
+        app.handle_challenge_key(KeyCode::Enter, None);
+        assert!(app.ui.challenge_open(), "invalid input keeps the panel");
+        assert!(matches!(app.online, OnlineState::Idle));
+        assert!(app.challenge_error.is_some());
+
+        app.challenge_opponent = "bob".to_string();
+        app.token = Some(lichess::Token::new("s3cret"));
+        app.handle_challenge_key(KeyCode::Enter, None);
+        assert!(!app.ui.challenge_open());
+        assert!(matches!(app.online, OnlineState::Challenging));
+        assert!(app.challenge_error.is_none());
+        assert_eq!(
+            app.token.as_ref().map(lichess::Token::as_str),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn challenge_clicks_pick_controls_and_dismiss_outside() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.open_challenge_panel();
+        app.challenge_opponent = "bob".to_string();
+
+        let panel = app.ui.challenge_panel().expect("panel").clone();
+        let center = |rect: ui::Rect| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let (x, y) = center(panel.clocks[4]);
+        app.handle_challenge_click(x, y);
+        assert_eq!(app.ui.challenge_clock_index(), 4);
+        let (x, y) = center(panel.colors[1]);
+        app.handle_challenge_click(x, y);
+        assert_eq!(app.ui.challenge_color_index(), 1);
+
+        // Outside the panel dismisses it without starting anything.
+        app.handle_challenge_click(0.0, 0.0);
+        assert!(!app.ui.challenge_open());
+        assert!(matches!(app.online, OnlineState::Idle));
+
+        // Create submits, so the panel closes and the state advances.
+        app.open_challenge_panel();
+        app.token = Some(lichess::Token::new("s3cret"));
+        let (x, y) = center(panel.create);
+        app.handle_challenge_click(x, y);
+        assert!(!app.ui.challenge_open());
+        assert!(matches!(app.online, OnlineState::Challenging));
+    }
+
+    #[test]
+    fn action_buttons_exist_only_while_the_game_is_running() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.sync_controls();
+        assert_eq!(app.ui.controls().len(), 3);
+
+        app.on_online_state(online_state("", "resign", Some("black")));
+        app.sync_controls();
+        assert!(app.ui.controls().is_empty());
+    }
+
+    #[test]
+    fn controls_report_an_optimistic_notice_and_ignore_finished_games() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.token = Some(lichess::Token::new("s3cret"));
+
+        app.send_control(ui::ControlKind::Takeback);
+        assert_eq!(app.online_notice.as_deref(), Some("Takeback offer sent"));
+        app.send_control(ui::ControlKind::Draw);
+        assert_eq!(app.online_notice.as_deref(), Some("Draw offer sent"));
+
+        // A finished game keeps its board but cannot send anything.
+        app.on_online_state(online_state("", "resign", Some("black")));
+        app.online_notice = None;
+        app.send_control(ui::ControlKind::Resign);
+        assert!(app.online_notice.is_none());
+    }
+
+    #[test]
+    fn local_play_has_no_player_bars() {        let app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         assert_eq!(app.mode, Mode::Local);
         assert!(app.player_bars().is_none());
     }

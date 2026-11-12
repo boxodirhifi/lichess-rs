@@ -16,6 +16,9 @@
 //! | `GET /api/challenge/{id}/show` | challenge status: `created`, `offline`, `canceled`, `declined`, `accepted` |
 //! | `GET /api/board/game/{id}/stream` | NDJSON events: `gameFull`, `gameState`, `chatLine`, `opponentGone` |
 //! | `POST /api/board/game/{id}/move/{uci}` | play a move |
+//! | `POST /api/board/game/{id}/takeback/yes` | offer a takeback |
+//! | `POST /api/board/game/{id}/draw/yes` | offer a draw |
+//! | `POST /api/board/game/{id}/resign` | resign |
 //!
 //! Every authenticated endpoint expects `Authorization: Bearer <token>`.
 //! [`ApiClient`] is pinned to `https://lichess.org` in production; the test
@@ -524,6 +527,29 @@ impl ApiClient {
         validate_uci(uci)?;
         self.call(self.post(token, &format!("/api/board/game/{game_id}/move/{uci}")))?;
         Ok(())
+    }
+
+    fn post_ok(&self, token: &Token, path: &str) -> Result<(), Error> {
+        self.call(self.post(token, path))?;
+        Ok(())
+    }
+
+    /// Offer a takeback (`takeback/yes`). The opponent still has to accept.
+    pub fn takeback(&self, token: &Token, game_id: &str) -> Result<(), Error> {
+        validate_game_id(game_id)?;
+        self.post_ok(token, &format!("/api/board/game/{game_id}/takeback/yes"))
+    }
+
+    /// Offer a draw (`draw/yes`). The opponent still has to accept.
+    pub fn offer_draw(&self, token: &Token, game_id: &str) -> Result<(), Error> {
+        validate_game_id(game_id)?;
+        self.post_ok(token, &format!("/api/board/game/{game_id}/draw/yes"))
+    }
+
+    /// Resign immediately.
+    pub fn resign(&self, token: &Token, game_id: &str) -> Result<(), Error> {
+        validate_game_id(game_id)?;
+        self.post_ok(token, &format!("/api/board/game/{game_id}/resign"))
     }
 }
 
@@ -1048,6 +1074,51 @@ mod tests {
             header(&request, "accept"),
             Some("application/x-ndjson")
         );
+    }
+
+    #[test]
+    fn control_endpoints_post_the_documented_paths() {
+        let server = Server::start(vec![
+            response("200 OK", r#"{"ok":true}"#),
+            response("200 OK", r#"{"ok":true}"#),
+            response("200 OK", r#"{"ok":true}"#),
+        ]);
+        let client = ApiClient::for_local_test(server.base());
+        let token = Token::new("s3cret");
+
+        client.takeback(&token, "abcd1234").expect("takeback");
+        client.offer_draw(&token, "abcd1234").expect("draw");
+        client.resign(&token, "abcd1234").expect("resign");
+
+        let paths: Vec<String> = (0..3)
+            .map(|_| {
+                server
+                    .next_request()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "POST /api/board/game/abcd1234/takeback/yes HTTP/1.1",
+                "POST /api/board/game/abcd1234/draw/yes HTTP/1.1",
+                "POST /api/board/game/abcd1234/resign HTTP/1.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn control_endpoints_validate_the_game_id_first() {
+        let server = Server::start(vec![]);
+        let client = ApiClient::for_local_test(server.base());
+        let token = Token::new("s3cret");
+        assert!(client.takeback(&token, "x").is_err());
+        assert!(client.offer_draw(&token, "x").is_err());
+        assert!(client.resign(&token, "x").is_err());
+        assert!(server.requests.try_recv().is_err(), "no request sent");
     }
 
     #[test]

@@ -78,6 +78,68 @@ const CHECK: [f32; 3] = [0.85, 0.25, 0.25];
 const EXPLOSION: [f32; 3] = [1.0, 1.0, 0.7];
 const PANEL: [f32; 3] = [0.24, 0.23, 0.22];
 const PANEL_CELL: [f32; 3] = [0.86, 0.82, 0.74];
+/// Dark field/cell backgrounds for the challenge panel (white text on top).
+const FIELD: [f32; 3] = [0.15, 0.16, 0.18];
+const CELL: [f32; 3] = [0.32, 0.33, 0.36];
+const CELL_HOVER: [f32; 3] = [0.41, 0.42, 0.46];
+const RESIGN: [f32; 3] = [0.52, 0.24, 0.24];
+
+/// Time-control presets offered by the challenge panel, in menu order.
+pub const CHALLENGE_CLOCKS: [(u32, u32); 6] = [
+    (60, 0),
+    (180, 0),
+    (180, 2),
+    (300, 0),
+    (600, 0),
+    (600, 5),
+];
+
+/// Colour choices in the challenge panel, in menu order. Kept as labels here;
+/// the client maps the index onto `lichess::ChallengeColor`.
+pub const CHALLENGE_COLORS: [&str; 3] = ["White", "Black", "Random"];
+
+/// A click inside the open challenge panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeHit {
+    Opponent,
+    Clock(usize),
+    Color(usize),
+    Create,
+    Cancel,
+    /// Inside the panel but not on a control (keep the panel open).
+    Inside,
+}
+
+/// The laid-out challenge panel. Text is drawn by the client; this only fixes
+/// the geometry and the current selections.
+#[derive(Debug, Clone)]
+pub struct ChallengePanel {
+    pub panel: Rect,
+    pub opponent: Rect,
+    pub clocks: [Rect; CHALLENGE_CLOCKS.len()],
+    pub colors: [Rect; CHALLENGE_COLORS.len()],
+    pub create: Rect,
+    pub cancel: Rect,
+    /// Hint/validation line under the buttons (drawn by the client).
+    pub status: Rect,
+    pub clock: usize,
+    pub color: usize,
+}
+
+/// In-game actions, drawn under the board during an online game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+    Takeback,
+    Draw,
+    Resign,
+}
+
+/// One laid-out in-game action button.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlButton {
+    pub rect: Rect,
+    pub kind: ControlKind,
+}
 
 /// Linear blend of two RGB colours; `t` is clamped, so callers can pass an
 /// eased 0..1 flash strength straight through.
@@ -161,6 +223,14 @@ pub struct UI {
     /// and release without movement stays a plain click.
     drag_moved: bool,
     promotion: Option<Promotion>,
+    /// Open challenge panel and the last selections (kept across opens).
+    challenge: Option<ChallengePanel>,
+    challenge_clock: usize,
+    challenge_color: usize,
+    /// In-game action buttons; geometry is fixed by layout, visibility is
+    /// controlled by the client (an online game is running).
+    controls: Vec<ControlButton>,
+    controls_visible: bool,
     screen_w: f32,
     screen_h: f32,
     board_px: f32,
@@ -215,6 +285,42 @@ impl UI {
         }
         self.apply_colors();
         self.relayout_promotion();
+        if self.challenge.is_some() {
+            self.relayout_challenge();
+        }
+        self.layout_controls();
+    }
+
+    /// (Re)build the in-game action buttons under the board. The row sits in
+    /// the bottom margin, below the player bar, and is clamped inside the
+    /// window on very short screens.
+    fn layout_controls(&mut self) {
+        let sq = self.sq_size;
+        self.controls.clear();
+        if sq <= 0.0 {
+            return;
+        }
+        let h = (sq * 0.30).clamp(18.0, 34.0);
+        let w = (sq * 1.55).clamp(72.0, 150.0);
+        let gap = (sq * 0.12).max(4.0);
+        let y = (self.offset_y + self.board_px + sq * 0.62)
+            .min((self.screen_h - h - 2.0).max(self.offset_y));
+        let x = self.offset_x;
+        for (i, kind) in [ControlKind::Takeback, ControlKind::Draw, ControlKind::Resign]
+            .into_iter()
+            .enumerate()
+        {
+            self.controls.push(ControlButton {
+                rect: Rect {
+                    x: x + i as f32 * (w + gap),
+                    y,
+                    w,
+                    h,
+                    color: if kind == ControlKind::Resign { RESIGN } else { CELL },
+                },
+                kind,
+            });
+        }
     }
 
     /// Re-place the promotion menu after a resize, keeping it beside the
@@ -342,6 +448,268 @@ impl UI {
     /// Clear any pending promotion (used when leaving play mode).
     pub fn clear_promotion(&mut self) {
         self.promotion = None;
+    }
+
+    // ---- challenge panel --------------------------------------------------
+
+    /// Open the modal challenge panel, laid out for the current window.
+    pub fn open_challenge(&mut self) {
+        self.relayout_challenge();
+    }
+
+    pub fn close_challenge(&mut self) {
+        self.challenge = None;
+    }
+
+    pub fn challenge_open(&self) -> bool {
+        self.challenge.is_some()
+    }
+
+    /// The current panel geometry, for text placement by the client.
+    pub fn challenge_panel(&self) -> Option<&ChallengePanel> {
+        self.challenge.as_ref()
+    }
+
+    pub fn select_challenge_clock(&mut self, index: usize) {
+        if index < CHALLENGE_CLOCKS.len() {
+            self.challenge_clock = index;
+            self.relayout_challenge();
+        }
+    }
+
+    pub fn select_challenge_color(&mut self, index: usize) {
+        if index < CHALLENGE_COLORS.len() {
+            self.challenge_color = index;
+            self.relayout_challenge();
+        }
+    }
+
+    /// The selected `(limit, increment)` preset, in seconds.
+    pub fn challenge_clock(&self) -> (u32, u32) {
+        CHALLENGE_CLOCKS[self.challenge_clock.min(CHALLENGE_CLOCKS.len() - 1)]
+    }
+
+    pub fn challenge_clock_index(&self) -> usize {
+        self.challenge_clock
+    }
+
+    /// 0 = White, 1 = Black, 2 = Random.
+    pub fn challenge_color_index(&self) -> usize {
+        self.challenge_color
+    }
+
+    /// What is under the pointer while the panel is open. `None` means the
+    /// pointer is outside the panel (the caller may dismiss it).
+    pub fn challenge_hit(&self, x: f32, y: f32) -> Option<ChallengeHit> {
+        let p = self.challenge.as_ref()?;
+        if !contains(&p.panel, x, y) {
+            return None;
+        }
+        if contains(&p.opponent, x, y) {
+            return Some(ChallengeHit::Opponent);
+        }
+        for (i, rect) in p.clocks.iter().enumerate() {
+            if contains(rect, x, y) {
+                return Some(ChallengeHit::Clock(i));
+            }
+        }
+        for (i, rect) in p.colors.iter().enumerate() {
+            if contains(rect, x, y) {
+                return Some(ChallengeHit::Color(i));
+            }
+        }
+        if contains(&p.create, x, y) {
+            Some(ChallengeHit::Create)
+        } else if contains(&p.cancel, x, y) {
+            Some(ChallengeHit::Cancel)
+        } else {
+            Some(ChallengeHit::Inside)
+        }
+    }
+
+    /// Panel quads with the current selection and a hover tint.
+    pub fn challenge_quads(&self, cursor: Option<(f32, f32)>) -> Vec<Rect> {
+        let Some(p) = self.challenge.as_ref() else {
+            return Vec::new();
+        };
+        let hover = |rect: &Rect| cursor.is_some_and(|(x, y)| contains(rect, x, y));
+        let mut quads = Vec::with_capacity(2 + CHALLENGE_CLOCKS.len() + CHALLENGE_COLORS.len() + 2);
+        quads.push(p.panel);
+        let mut input = p.opponent;
+        input.color = FIELD;
+        quads.push(input);
+        for (i, rect) in p.clocks.iter().enumerate() {
+            let mut r = *rect;
+            r.color = if i == p.clock {
+                SELECTED
+            } else if hover(rect) {
+                CELL_HOVER
+            } else {
+                CELL
+            };
+            quads.push(r);
+        }
+        for (i, rect) in p.colors.iter().enumerate() {
+            let mut r = *rect;
+            r.color = if i == p.color {
+                SELECTED
+            } else if hover(rect) {
+                CELL_HOVER
+            } else {
+                CELL
+            };
+            quads.push(r);
+        }
+        let mut create = p.create;
+        create.color = if hover(&p.create) {
+            blend(SELECTED, [1.0, 1.0, 1.0], 0.12)
+        } else {
+            SELECTED
+        };
+        quads.push(create);
+        let mut cancel = p.cancel;
+        cancel.color = if hover(&p.cancel) { CELL_HOVER } else { CELL };
+        quads.push(cancel);
+        quads
+    }
+
+    fn relayout_challenge(&mut self) {
+        if self.screen_w <= 0.0 {
+            return;
+        }
+        self.challenge = Some(self.layout_challenge());
+    }
+
+    fn layout_challenge(&self) -> ChallengePanel {
+        let margin = (self.screen_w.min(self.screen_h) * 0.02).max(6.0);
+        let max_w = (self.screen_w - margin * 2.0).max(200.0);
+        let w = (self.board_px * 0.95).clamp(280.0, 560.0).min(max_w);
+        let pad = (w * 0.05).clamp(12.0, 26.0);
+        let row = (w * 0.085).clamp(26.0, 46.0);
+        let inner = w - pad * 2.0;
+        let gap = (pad * 0.28).max(4.0);
+
+        let title_y = pad;
+        let input_y = title_y + row * 1.15;
+        let input_h = row * 0.95;
+        let clocks_label_y = input_y + input_h + row * 0.30;
+        let clocks_y = clocks_label_y + row * 0.38;
+        let clock_h = row * 0.80;
+        let colors_label_y = clocks_y + clock_h + row * 0.30;
+        let colors_y = colors_label_y + row * 0.38;
+        let color_h = row * 0.80;
+        let buttons_y = colors_y + color_h + row * 0.55;
+        let button_h = row * 0.95;
+        let status_y = buttons_y + button_h + row * 0.55;
+        let status_h = row * 0.65;
+        let h = status_y + status_h + pad * 0.7;
+
+        let x = (self.screen_w - w) / 2.0;
+        let y = (self.screen_h - h) / 2.0;
+        let left = x + pad;
+
+        let clock_count = CHALLENGE_CLOCKS.len() as f32;
+        let clock_w = (inner - gap * (clock_count - 1.0)) / clock_count;
+        let clocks = std::array::from_fn(|i| Rect {
+            x: left + i as f32 * (clock_w + gap),
+            y: y + clocks_y,
+            w: clock_w,
+            h: clock_h,
+            color: CELL,
+        });
+
+        let color_count = CHALLENGE_COLORS.len() as f32;
+        let color_w = (inner - gap * (color_count - 1.0)) / color_count;
+        let colors = std::array::from_fn(|i| Rect {
+            x: left + i as f32 * (color_w + gap),
+            y: y + colors_y,
+            w: color_w,
+            h: color_h,
+            color: CELL,
+        });
+
+        let button_w = (inner - gap) / 2.0;
+        let cancel = Rect {
+            x: left,
+            y: y + buttons_y,
+            w: button_w,
+            h: button_h,
+            color: CELL,
+        };
+        let create = Rect {
+            x: left + button_w + gap,
+            y: y + buttons_y,
+            w: button_w,
+            h: button_h,
+            color: SELECTED,
+        };
+
+        ChallengePanel {
+            panel: Rect {
+                x,
+                y,
+                w,
+                h,
+                color: PANEL,
+            },
+            opponent: Rect {
+                x: left,
+                y: y + input_y,
+                w: inner,
+                h: input_h,
+                color: FIELD,
+            },
+            clocks,
+            colors,
+            create,
+            cancel,
+            status: Rect {
+                x: left,
+                y: y + status_y,
+                w: inner,
+                h: status_h,
+                color: PANEL,
+            },
+            clock: self.challenge_clock,
+            color: self.challenge_color,
+        }
+    }
+
+    // ---- in-game action buttons ------------------------------------------
+
+    /// Show or hide Takeback / Draw / Resign (an online game is running).
+    pub fn set_controls_visible(&mut self, visible: bool) {
+        self.controls_visible = visible;
+    }
+
+    pub fn controls(&self) -> &[ControlButton] {
+        if self.controls_visible {
+            &self.controls
+        } else {
+            &[]
+        }
+    }
+
+    /// Quads for the action row, with a hover tint.
+    pub fn control_quads(&self, cursor: Option<(f32, f32)>) -> Vec<Rect> {
+        self.controls()
+            .iter()
+            .map(|button| {
+                let mut rect = button.rect;
+                if cursor.is_some_and(|(x, y)| contains(&rect, x, y)) {
+                    rect.color = blend(rect.color, [1.0, 1.0, 1.0], 0.15);
+                }
+                rect
+            })
+            .collect()
+    }
+
+    /// Which action button, if any, is under the pointer.
+    pub fn control_at(&self, x: f32, y: f32) -> Option<ControlKind> {
+        self.controls()
+            .iter()
+            .find(|button| contains(&button.rect, x, y))
+            .map(|button| button.kind)
     }
 
     fn apply_colors(&mut self) {
@@ -1077,6 +1445,127 @@ mod tests {
         assert_eq!(BoardTheme::from_name("purple"), None);
         assert_eq!(BoardTheme::default(), BoardTheme::Brown);
         assert_eq!(UI::new().board_theme(), BoardTheme::Brown);
+    }
+
+    fn center(rect: Rect) -> (f32, f32) {
+        (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+    }
+
+    #[test]
+    fn the_challenge_panel_hit_tests_every_control() {
+        let mut ui = ui_at(800.0, 600.0);
+        assert!(!ui.challenge_open());
+        ui.open_challenge();
+        assert!(ui.challenge_open());
+
+        let p = ui.challenge_panel().expect("panel").clone();
+        assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0);
+        assert!(p.panel.x + p.panel.w <= 800.0);
+        assert!(p.panel.y + p.panel.h <= 600.0);
+
+        assert_eq!(
+            ui.challenge_hit(center(p.opponent).0, center(p.opponent).1),
+            Some(ChallengeHit::Opponent)
+        );
+        for (i, rect) in p.clocks.iter().enumerate() {
+            assert_eq!(
+                ui.challenge_hit(center(*rect).0, center(*rect).1),
+                Some(ChallengeHit::Clock(i))
+            );
+        }
+        for (i, rect) in p.colors.iter().enumerate() {
+            assert_eq!(
+                ui.challenge_hit(center(*rect).0, center(*rect).1),
+                Some(ChallengeHit::Color(i))
+            );
+        }
+        assert_eq!(
+            ui.challenge_hit(center(p.create).0, center(p.create).1),
+            Some(ChallengeHit::Create)
+        );
+        assert_eq!(
+            ui.challenge_hit(center(p.cancel).0, center(p.cancel).1),
+            Some(ChallengeHit::Cancel)
+        );
+        assert_eq!(
+            ui.challenge_hit(p.panel.x + 1.0, p.panel.y + 1.0),
+            Some(ChallengeHit::Inside)
+        );
+        assert_eq!(ui.challenge_hit(1.0, 1.0), None);
+
+        ui.close_challenge();
+        assert!(!ui.challenge_open());
+        assert_eq!(ui.challenge_hit(center(p.create).0, center(p.create).1), None);
+    }
+
+    #[test]
+    fn challenge_selections_persist_and_repaint_the_cells() {
+        let mut ui = ui_at(800.0, 600.0);
+        ui.open_challenge();
+        assert_eq!(ui.challenge_clock_index(), 0);
+        assert_eq!(ui.challenge_clock(), CHALLENGE_CLOCKS[0]);
+
+        ui.select_challenge_clock(3);
+        ui.select_challenge_color(2);
+        assert_eq!(ui.challenge_clock_index(), 3);
+        assert_eq!(ui.challenge_clock(), CHALLENGE_CLOCKS[3]);
+        assert_eq!(ui.challenge_color_index(), 2);
+
+        let p = ui.challenge_panel().expect("panel");
+        assert_eq!(p.clock, 3);
+        assert_eq!(p.color, 2);
+
+        // panel + input + 6 clocks + 3 colours + create + cancel
+        let quads = ui.challenge_quads(None);
+        assert_eq!(quads.len(), 1 + 1 + 6 + 3 + 2);
+        assert_eq!(quads[2 + 3].color, SELECTED);
+        assert_eq!(quads[2 + 6 + 2].color, SELECTED);
+
+        // Re-opening keeps the user's last choice.
+        ui.close_challenge();
+        ui.open_challenge();
+        assert_eq!(ui.challenge_clock_index(), 3);
+        assert_eq!(ui.challenge_color_index(), 2);
+    }
+
+    #[test]
+    fn a_small_window_keeps_the_panel_inside_the_screen() {
+        for (w, h) in [(360.0, 640.0), (500.0, 400.0), (1200.0, 900.0)] {
+            let mut ui = ui_at(w, h);
+            ui.open_challenge();
+            let p = ui.challenge_panel().expect("panel");
+            assert!(p.panel.x >= 0.0, "{w}x{h}");
+            assert!(p.panel.y >= 0.0, "{w}x{h}");
+            assert!(p.panel.x + p.panel.w <= w, "{w}x{h}");
+            assert!(p.panel.y + p.panel.h <= h, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn action_buttons_are_hit_testable_and_can_be_hidden() {
+        let mut ui = ui_at(800.0, 600.0);
+        assert!(ui.controls().is_empty());
+        assert_eq!(ui.control_at(100.0, 100.0), None);
+
+        ui.set_controls_visible(true);
+        let controls = ui.controls().to_vec();
+        assert_eq!(controls.len(), 3);
+        assert_eq!(
+            controls.iter().map(|b| b.kind).collect::<Vec<_>>(),
+            vec![ControlKind::Takeback, ControlKind::Draw, ControlKind::Resign]
+        );
+        for button in &controls {
+            let (x, y) = center(button.rect);
+            assert_eq!(ui.control_at(x, y), Some(button.kind));
+            assert!(button.rect.x + button.rect.w <= 800.0);
+            assert!(button.rect.y + button.rect.h <= 600.0);
+        }
+        assert_eq!(ui.control_quads(None).len(), 3);
+
+        ui.set_controls_visible(false);
+        let (x, y) = center(controls[0].rect);
+        assert_eq!(ui.control_at(x, y), None);
+        assert!(ui.control_quads(None).is_empty());
     }
 
     #[test]
