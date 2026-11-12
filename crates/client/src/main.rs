@@ -2452,7 +2452,14 @@ impl ApplicationHandler<NetEvent> for App {
                         pieces: &pieces,
                         dragged,
                     };
-                    rend.render(&scene);
+                    // A stale surface is reconfigured inside the renderer and
+                    // asks for exactly one more pass; anything further waits
+                    // for the next real event, so redraws stay event-driven.
+                    if rend.render(&scene) {
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                    }
                 }
                 // Keep animating only while the blast is alive; once it
                 // expires the loop drops back to Wait with no timer.

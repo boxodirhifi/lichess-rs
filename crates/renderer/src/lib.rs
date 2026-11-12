@@ -158,6 +158,10 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// A stale surface has earned exactly one extra redraw; the retry
+    /// already burnt that, so a still-broken surface waits for the next
+    /// real event instead of spinning the loop.
+    surface_retried: bool,
     #[allow(dead_code)]
     window: Arc<Window>,
     quad_pipeline: QuadPipeline,
@@ -230,6 +234,7 @@ impl Renderer {
             device,
             queue,
             config,
+            surface_retried: false,
             window,
             quad_pipeline,
             overlay_pipeline,
@@ -266,25 +271,40 @@ impl Renderer {
         self.text_pipeline.text_width(text, size)
     }
 
-    pub fn render(&mut self, scene: &Scene) {
+    /// Render one frame. Returns `true` when the surface buffer was stale
+    /// (`Lost` or `Outdated`) and has just been reconfigured, so the caller
+    /// should schedule exactly one more pass; a second consecutive failure
+    /// returns `false`, so a persistently broken surface can never spin the
+    /// event loop on retries.
+    pub fn render(&mut self, scene: &Scene) -> bool {
         if self.config.width == 0 || self.config.height == 0 {
-            return;
+            return false;
         }
         let output = match self.surface.get_current_texture() {
             Ok(tex) => tex,
-            Err(wgpu::SurfaceError::Lost) => {
+            Err(e @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
+                // A compositor-side resize/redraw or a driver hiccup can
+                // invalidate the current texture; recreating the surface
+                // config is the whole fix.
                 self.surface.configure(&self.device, &self.config);
-                return;
+                if self.surface_retried {
+                    log::warn!("Surface stayed {:?} after reconfigure; waiting for the next event", e);
+                    return false;
+                }
+                log::warn!("Surface {:?}; reconfigured, retrying once", e);
+                self.surface_retried = true;
+                return true;
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 log::error!("Out of GPU memory!");
-                return;
+                return false;
             }
             Err(e) => {
                 log::error!("Surface error: {:?}", e);
-                return;
+                return false;
             }
         };
+        self.surface_retried = false;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Convert the banner (if any) into centered TextElement(s) using window
@@ -351,6 +371,7 @@ impl Renderer {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        false
     }
 }
 
