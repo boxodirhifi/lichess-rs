@@ -396,6 +396,21 @@ fn derive_played_move(prev: &VariantPosition, next: &VariantPosition) -> Option<
     None
 }
 
+/// The (origin, destination) tint of the last echoed move, re-derived from
+/// the server position it produced. Used to restore the last-move highlight
+/// after an accepted takeback rewound the move list.
+fn last_move_of(initial_fen: &str, moves: &[String]) -> Option<(Square, Square)> {
+    let last = moves.last()?;
+    let prev = game_position(initial_fen, &moves[..moves.len() - 1]);
+    let Ok(uci) = UciMove::from_ascii(last.as_bytes()) else {
+        return None;
+    };
+    let Ok(mv) = uci.to_move(&prev) else {
+        return None;
+    };
+    mv.from().map(|from| (from, move_destination(mv, &prev)))
+}
+
 #[cfg(test)]
 fn derive_last_move(prev: &VariantPosition, next: &VariantPosition) -> Option<(Square, Square)> {
     let mv = derive_played_move(prev, next)?;
@@ -823,7 +838,8 @@ impl App {
         let mut accepted = false;
 
         if let OnlineState::Active(game) = &mut self.online {
-            let mut tail_start = game.server_moves.len().min(new_moves.len());
+            let previous_len = game.server_moves.len();
+            let mut tail_start = previous_len.min(new_moves.len());
             if let Some(pending) = game.pending.take() {
                 if new_moves.get(pending.index) == Some(&pending.uci) {
                     // Confirmed: the optimistic SAN is already in history.
@@ -841,6 +857,11 @@ impl App {
                 }
             }
 
+            // An accepted takeback shrinks the echoed list; rewind the
+            // display state with it, but only when none of our own pending
+            // move is riding along (nothing to roll back then, the optimistic
+            // SAN stays on screen).
+            let rewind = game.pending.is_none() && new_moves.len() < previous_len;
             // Replay only the unseen tail on the old authoritative board, so
             // every new ply contributes exactly one SAN entry and the final
             // one drives the last-move highlight and Atomic blast. On
@@ -873,6 +894,14 @@ impl App {
             // the authoritative position wins (including the rollback case).
             if game.pending.is_none() {
                 game.board = game.server_board.clone();
+            }
+            // A confirmed takeback rewound the echoed list: rewind the
+            // history to the shorter count and re-derive the tint from the
+            // position the server kept, so model and view agree again.
+            if self.mode == Mode::Play && rewind {
+                self.history.truncate(game.server_moves.len());
+                self.ui
+                    .set_last_move(last_move_of(&game.initial_fen, &game.server_moves));
             }
             game.white_clock = state.wtime as f64 / 1000.0;
             game.black_clock = state.btime as f64 / 1000.0;
@@ -4543,6 +4572,35 @@ mod tests {
         app.on_online_full(online_full());
         app.token = Some(lichess::Token::new("s3cret"));
         app
+    }
+
+    #[test]
+    fn an_accepted_takeback_rewinds_history_and_highlight() {
+        let mut app = app_in_online_game();
+        // White plays e4; the server echoes it and then e5 arrives.
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+        app.on_online_state(online_state("e2e4", "started", None));
+        app.on_online_state(online_state("e2e4 e7e5", "started", None));
+        assert_eq!(app.history, vec!["e4", "e5"]);
+        assert_eq!(app.ui.last_move(), Some((Square::E7, Square::E5)));
+
+        // The opponent accepts a takeback: the echoed list shrinks by a ply.
+        app.on_online_state(online_state("e2e4", "started", None));
+
+        assert_eq!(app.history, vec!["e4"], "history must rewind with the server");
+        assert_eq!(
+            app.ui.last_move(),
+            Some((Square::E2, Square::E4)),
+            "the tint follows the position the server kept"
+        );
+        let board = app.online_game().expect("active game").board.board();
+        assert!(board.piece_at(Square::E5).is_none(), "e5 is undone");
+        assert!(board.piece_at(Square::E4).is_some());
     }
 
     #[test]
