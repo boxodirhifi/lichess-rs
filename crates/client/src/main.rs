@@ -41,31 +41,17 @@ pub enum NetEvent {
         black_secs: u32,
     },
     /// Token validated; carries the account name.
-    OnlineReady {
+    OnlineAccount {
         username: String,
     },
+    /// The challenge exists; the opponent still has to accept it.
+    OnlineChallengeCreated {
+        challenge_id: String,
+    },
     /// A Board API game (accepted challenge) is set up.
-    OnlineFull {
-        game_id: String,
-        initial_fen: Option<String>,
-        white_name: String,
-        white_rating: u32,
-        black_name: String,
-        black_rating: u32,
-        moves: String,
-        wtime_ms: u64,
-        btime_ms: u64,
-        status: String,
-        winner: Option<Color>,
-    },
+    OnlineFull(Box<lichess::GameFull>),
     /// Incremental Board API state update.
-    OnlineState {
-        moves: String,
-        wtime_ms: u64,
-        btime_ms: u64,
-        status: String,
-        winner: Option<Color>,
-    },
+    OnlineState(lichess::GameState),
     OnlineFailed {
         message: String,
     },
@@ -97,12 +83,52 @@ struct OnlineGame {
     winner: Option<Color>,
 }
 
-enum Online {
+enum OnlineState {
+    /// No online flow running.
     Idle,
-    /// Challenge created, waiting for the opponent's acceptance.
-    Waiting,
-    /// Boxed: the running game is much larger than the marker variants.
+    /// The token is being validated and the challenge created.
+    Challenging,
+    /// The challenge exists; waiting for the opponent to accept it.
+    WaitingAccept { challenge_id: String },
+    /// A running Board API game. Only this state accepts local moves.
     Active(Box<OnlineGame>),
+    /// The game ended (resign, mate, clock, draw); the final board stays up.
+    Finished(Box<OnlineGame>),
+    /// The flow or stream failed. A game, when present, stays visible but is
+    /// no longer playable.
+    Failed {
+        message: String,
+        game: Option<Box<OnlineGame>>,
+    },
+}
+
+impl OnlineState {
+    /// The game to display, in any state that has one.
+    fn game(&self) -> Option<&OnlineGame> {
+        match self {
+            OnlineState::Active(game)
+            | OnlineState::Finished(game)
+            | OnlineState::Failed {
+                game: Some(game), ..
+            } => Some(game),
+            _ => None,
+        }
+    }
+
+    /// The game local moves may be applied to.
+    fn active_mut(&mut self) -> Option<&mut OnlineGame> {
+        match self {
+            OnlineState::Active(game) => Some(game),
+            _ => None,
+        }
+    }
+
+    fn is_startable(&self) -> bool {
+        matches!(
+            self,
+            OnlineState::Idle | OnlineState::Finished(_) | OnlineState::Failed { .. }
+        )
+    }
 }
 
 struct LiveGameInfo {
@@ -129,10 +155,10 @@ struct App {
     mode: Mode,
     cursor_pos: (f64, f64),
     side: Color,
-    token: Option<String>,
+    token: Option<lichess::Token>,
+    api: lichess::ApiClient,
     my_username: Option<String>,
-    online: Online,
-    online_error: Option<String>,
+    online: OnlineState,
     /// SAN of every move seen in the current game, oldest first. Rebuilt only
     /// from applied/derived moves; cleared on a new game or a mode switch.
     history: Vec<String>,
@@ -541,11 +567,12 @@ fn coord_color(theme: ui::BoardTheme, file: u8, rank: u8) -> [f32; 4] {
 }
 
 impl App {
-    /// Kick off the online flow: read the token, read the opponent, and hand
-    /// the long-running work (challenge creation + game stream) to a worker
-    /// thread. Guards against double-starting while one is running.
+    /// Kick off the online flow: read the token and the seeded opponent, build
+    /// a validated challenge request, and hand the long-running work to a
+    /// worker thread. The state machine is `Idle → Challenging`, then the
+    /// worker reports `WaitingAccept` / `Active` / `Failed`.
     fn start_online_challenge(&mut self) {
-        if !matches!(self.online, Online::Idle) {
+        if !self.online.is_startable() {
             return;
         }
         // The auth flow owns the token file: create an empty owner-only file if
@@ -560,23 +587,157 @@ impl App {
             permissions::warn_if_shared_readable(&path, "API token");
         }
         let Some(token) = lichess::read_token() else {
-            self.online_error = Some(
-                "No API token — set LICHESS_API_TOKEN or ~/.config/lichess-rs/token".to_string(),
-            );
+            self.online = OnlineState::Failed {
+                message: "No API token — set LICHESS_API_TOKEN or ~/.config/lichess-rs/token"
+                    .to_string(),
+                game: None,
+            };
             return;
         };
         let Some(opponent) = read_opponent() else {
-            self.online_error = Some(
-                "No opponent — set LICHESS_OPPONENT or ~/.config/lichess-rs/opponent".to_string(),
-            );
+            self.online = OnlineState::Failed {
+                message: "No opponent — set LICHESS_OPPONENT or ~/.config/lichess-rs/opponent"
+                    .to_string(),
+                game: None,
+            };
             return;
         };
+        // Stage 2 replaces these defaults with the challenge panel.
+        let request = match lichess::ChallengeRequest::new(
+            opponent,
+            false,
+            180,
+            2,
+            lichess::ChallengeColor::Random,
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                self.online = OnlineState::Failed {
+                    message: format!("Invalid challenge: {e}"),
+                    game: None,
+                };
+                return;
+            }
+        };
         self.token = Some(token.clone());
-        self.online = Online::Waiting;
+        self.online = OnlineState::Challenging;
         let Some(proxy) = self.proxy.clone() else {
             return;
         };
-        std::thread::spawn(move || online_worker(proxy, token, opponent));
+        let api = self.api.clone();
+        std::thread::spawn(move || online_worker(proxy, api, token, request));
+    }
+
+    /// `OnlineChallengeCreated`: the challenge exists, so only the opponent's
+    /// acceptance is missing. Ignored unless we were still validating; a late
+    /// event must not pull an active game back to `WaitingAccept`.
+    fn on_online_challenge_created(&mut self, challenge_id: String) {
+        if matches!(self.online, OnlineState::Challenging) {
+            log::info!("Challenge {challenge_id} sent; waiting for acceptance");
+            self.online = OnlineState::WaitingAccept { challenge_id };
+        }
+    }
+
+    /// `gameFull`: set up the running game and enter `Active` (or `Finished`
+    /// when the first frame already carries a terminal status).
+    fn on_online_full(&mut self, full: lichess::GameFull) {
+        let Some(me) = self.my_username.clone() else {
+            self.on_online_failed("Online account was not loaded".to_string());
+            return;
+        };
+        let my_color = if full.white.name.eq_ignore_ascii_case(&me) {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let mut board = match full.initial_fen.as_deref().unwrap_or("startpos") {
+            "startpos" => VariantPosition::default(),
+            fen => position_from_fen("standard", fen).unwrap_or_default(),
+        };
+        replay_uci(&mut board, &full.state.moves);
+        // A fresh online game starts without a last-move highlight.
+        self.ui.set_last_move(None);
+        self.history.clear();
+        let game_over = full.state.status != "started";
+        let game = Box::new(OnlineGame {
+            game_id: full.id,
+            board,
+            my_color,
+            white_name: full.white.name,
+            black_name: full.black.name,
+            white_rating: full.white.rating.unwrap_or(0),
+            black_rating: full.black.rating.unwrap_or(0),
+            white_clock: full.state.wtime as f64 / 1000.0,
+            black_clock: full.state.btime as f64 / 1000.0,
+            last_update: Instant::now(),
+            game_over,
+            winner: winner_color(full.state.winner.as_deref()),
+        });
+        self.online = if game_over {
+            OnlineState::Finished(game)
+        } else {
+            OnlineState::Active(game)
+        };
+    }
+
+    /// `gameState`: the server echoes the whole move list, so only the unseen
+    /// tail advances the board. A terminal status moves the game to `Finished`
+    /// while keeping the final position visible.
+    fn on_online_state(&mut self, state: lichess::GameState) {
+        let mut advanced = None;
+        let game_over = state.status != "started";
+        if let OnlineState::Active(game) = &mut self.online {
+            let prev = game.board.clone();
+            replay_uci(&mut game.board, &state.moves);
+            if prev.board() != game.board.board() {
+                let played = derive_played_move(&prev, &game.board);
+                advanced = Some((
+                    derive_last_move(&prev, &game.board),
+                    played.and_then(|mv| explosion_for(&prev, &game.board, mv)),
+                ));
+            }
+            game.white_clock = state.wtime as f64 / 1000.0;
+            game.black_clock = state.btime as f64 / 1000.0;
+            game.last_update = Instant::now();
+            game.game_over = game_over;
+            game.winner = winner_color(state.winner.as_deref());
+        }
+        if let Some((last, explosion)) = advanced {
+            self.ui.set_last_move(last);
+            // Background streams must not animate another mode's game.
+            if self.mode == Mode::Play {
+                self.explosion = explosion;
+            }
+        }
+        if game_over {
+            let previous = std::mem::replace(&mut self.online, OnlineState::Idle);
+            if let OnlineState::Active(game) = previous {
+                self.online = OnlineState::Finished(game);
+            } else {
+                self.online = previous;
+            }
+        }
+    }
+
+    /// Any worker error lands here. The last board stays visible when one
+    /// exists, but the state is no longer playable.
+    fn on_online_failed(&mut self, message: String) {
+        let previous = std::mem::replace(&mut self.online, OnlineState::Idle);
+        if let OnlineState::WaitingAccept { challenge_id } = &previous {
+            log::warn!("Challenge {challenge_id} did not start: {message}");
+        }
+        let game = match previous {
+            OnlineState::Active(game) | OnlineState::Finished(game) => Some(game),
+            OnlineState::Failed { game, .. } => game,
+            _ => None,
+        };
+        // Belt and braces: no code path may echo the token into the banner.
+        let message = match &self.token {
+            Some(token) => lichess::redact(&message, token.as_str()),
+            None => message,
+        };
+        log::warn!("Online play failed: {message}");
+        self.online = OnlineState::Failed { message, game };
     }
 
     fn refresh_check_highlight(&mut self) {
@@ -877,10 +1038,7 @@ impl App {
             let board = match self.mode {
                 Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
                 Mode::Local => &self.board,
-                Mode::Play => match self.online_game() {
-                    Some(game) => &game.board,
-                    None => &self.board,
-                },
+                Mode::Play => self.online_game().map(|game| &game.board).unwrap_or(&self.board),
             };
             let (black_usable, white_usable) = match self.mode {
                 Mode::Live => (false, false),
@@ -891,13 +1049,19 @@ impl App {
                         live && board.turn() == Color::White,
                     )
                 }
-                Mode::Play => match self.online_game() {
-                    Some(game) if !game.game_over && game.board.turn() == game.my_color => (
-                        game.my_color == Color::Black,
-                        game.my_color == Color::White,
-                    ),
-                    _ => (false, false),
-                },
+                Mode::Play => {
+                    match &self.online {
+                        OnlineState::Active(game)
+                            if !game.game_over && game.board.turn() == game.my_color =>
+                        {
+                            (
+                                game.my_color == Color::Black,
+                                game.my_color == Color::White,
+                            )
+                        }
+                        _ => (false, false),
+                    }
+                }
             };
             (
                 pocket_items(board, Color::Black),
@@ -984,7 +1148,7 @@ impl App {
                 _ => None,
             },
             match &self.online {
-                Online::Active(game) if self.mode == Mode::Play && !game.game_over => {
+                OnlineState::Active(game) if self.mode == Mode::Play && !game.game_over => {
                     Some(&game.last_update)
                 }
                 _ => None,
@@ -1047,10 +1211,7 @@ impl App {
     fn active_board(&mut self) -> Option<&mut VariantPosition> {
         match self.mode {
             Mode::Local => Some(&mut self.board),
-            Mode::Play => match &mut self.online {
-                Online::Active(game) => Some(&mut game.board),
-                _ => None,
-            },
+            Mode::Play => self.online.active_mut().map(|game| &mut game.board),
             Mode::Live => None,
         }
     }
@@ -1061,20 +1222,21 @@ impl App {
         let game_id = self.online_game().map(|game| game.game_id.clone());
         let Some(game_id) = game_id else { return };
         let Some(token) = self.token.clone() else { return };
+        let api = self.api.clone();
         let uci = mv.to_uci(CastlingMode::Standard).to_string();
         std::thread::spawn(move || {
-            if let Err(e) = lichess::play_board_move(&token, &game_id, &uci) {
-                log::warn!("Move post failed: {}", e);
+            if let Err(e) = api.play_board_move(&token, &game_id, &uci) {
+                log::warn!(
+                    "Move post failed: {}",
+                    safe_error("move", e, &token)
+                );
             }
         });
     }
 
-    /// The running online game, if any.
+    /// The online game to display, in any state that still has a board.
     fn online_game(&self) -> Option<&OnlineGame> {
-        match &self.online {
-            Online::Active(game) => Some(game),
-            _ => None,
-        }
+        self.online.game()
     }
 
     fn finish_promotion(&mut self, role: Role) {
@@ -1240,9 +1402,13 @@ impl App {
         // side, only while the server says the game is still running.
         let my_turn = match self.mode {
             Mode::Local => !self.local_game_over(),
-            Mode::Play => match self.online_game() {
-                Some(game) => !game.game_over && game.board.turn() == game.my_color,
-                None => return,
+            Mode::Play => match &self.online {
+                OnlineState::Active(game)
+                    if !game.game_over && game.board.turn() == game.my_color =>
+                {
+                    true
+                }
+                _ => return,
             },
             Mode::Live => unreachable!(),
         };
@@ -1347,10 +1513,10 @@ impl App {
     fn can_select_piece(&self, color: Color) -> bool {
         match self.mode {
             Mode::Local => true,
-            Mode::Play => self
-                .online_game()
-                .map(|game| game.my_color == color)
-                .unwrap_or(false),
+            Mode::Play => match &self.online {
+                OnlineState::Active(game) => game.my_color == color,
+                _ => false,
+            },
             Mode::Live => false,
         }
     }
@@ -1487,85 +1653,15 @@ impl ApplicationHandler<NetEvent> for App {
                     }
                 }
             }
-            NetEvent::OnlineReady { username } => {
+            NetEvent::OnlineAccount { username } => {
                 self.my_username = Some(username);
             }
-            NetEvent::OnlineFull {
-                game_id,
-                initial_fen,
-                white_name,
-                black_name,
-                white_rating,
-                black_rating,
-                moves,
-                wtime_ms,
-                btime_ms,
-                status,
-                winner,
-            } => {
-                let me = self.my_username.clone();
-                let mine = |name: &str| me.as_deref().is_some_and(|me| me.eq_ignore_ascii_case(name));
-                let my_color = if mine(&white_name) {
-                    Color::White
-                } else {
-                    Color::Black
-                };
-                let mut board = match initial_fen.as_deref().unwrap_or("startpos") {
-                    "startpos" => VariantPosition::default(),
-                    fen => position_from_fen("standard", fen).unwrap_or_default(),
-                };
-                replay_uci(&mut board, &moves);
-                // A fresh online game starts without a last-move highlight.
-                self.ui.set_last_move(None);
-                self.history.clear();
-                self.online = Online::Active(Box::new(OnlineGame {
-                    game_id,
-                    board,
-                    my_color,
-                    white_name,
-                    black_name,
-                    white_rating,
-                    black_rating,
-                    white_clock: wtime_ms as f64 / 1000.0,
-                    black_clock: btime_ms as f64 / 1000.0,
-                    last_update: Instant::now(),
-                    game_over: status != "started",
-                    winner,
-                }));
+            NetEvent::OnlineChallengeCreated { challenge_id } => {
+                self.on_online_challenge_created(challenge_id);
             }
-            NetEvent::OnlineState { moves, wtime_ms, btime_ms, status, winner } => {
-                let mut advanced = None;
-                if let Online::Active(game) = &mut self.online {
-                    // The server echoes the whole move list; only the unseen
-                    // tail advances the board. Compare before/after and derive
-                    // the move rather than guessing.
-                    let prev = game.board.clone();
-                    replay_uci(&mut game.board, &moves);
-                    if prev.board() != game.board.board() {
-                        let played = derive_played_move(&prev, &game.board);
-                        advanced = Some((
-                            derive_last_move(&prev, &game.board),
-                            played.and_then(|mv| explosion_for(&prev, &game.board, mv)),
-                        ));
-                    }
-                    game.white_clock = wtime_ms as f64 / 1000.0;
-                    game.black_clock = btime_ms as f64 / 1000.0;
-                    game.last_update = Instant::now();
-                    game.game_over = status != "started";
-                    game.winner = winner;
-                }
-                if let Some((last, explosion)) = advanced {
-                    self.ui.set_last_move(last);
-                    // Background streams must not animate another mode's game.
-                    if self.mode == Mode::Play {
-                        self.explosion = explosion;
-                    }
-                }
-            }
-            NetEvent::OnlineFailed { message } => {
-                self.online_error = Some(message);
-                self.online = Online::Idle;
-            }
+            NetEvent::OnlineFull(full) => self.on_online_full(*full),
+            NetEvent::OnlineState(state) => self.on_online_state(state),
+            NetEvent::OnlineFailed { message } => self.on_online_failed(message),
             NetEvent::ConfigChanged => {
                 let Some(path) = self.config_path.clone() else {
                     return;
@@ -1682,7 +1778,6 @@ impl ApplicationHandler<NetEvent> for App {
                         self.ui.set_last_move(None);
                         self.history.clear();
                         self.clear_explosion();
-                        self.online_error = None;
                         self.start_online_challenge();
                         needs_redraw = true;
                     }
@@ -1761,26 +1856,24 @@ impl ApplicationHandler<NetEvent> for App {
                             None
                         }
                     }
-                    Mode::Play => {
-                        if let Some(error) = &self.online_error {
-                            Some(error.clone())
-                        } else {
-                            match &self.online {
-                                Online::Waiting => {
-                                    Some("Challenge sent - waiting for opponent to accept".to_string())
-                                }
-                                Online::Active(game) if game.game_over => {
-                                    let text = match game.winner {
-                                        Some(color) if color == game.my_color => "You win!",
-                                        Some(_) => "You lose",
-                                        None => "Drawn game",
-                                    };
-                                    Some(text.to_string())
-                                }
-                                _ => None,
-                            }
+                    Mode::Play => match &self.online {
+                        OnlineState::Failed { message, .. } => Some(message.clone()),
+                        OnlineState::Challenging => {
+                            Some("Validating token and creating the challenge…".to_string())
                         }
-                    }
+                        OnlineState::WaitingAccept { .. } => {
+                            Some("Challenge sent - waiting for opponent to accept".to_string())
+                        }
+                        OnlineState::Finished(game) => {
+                            let text = match game.winner {
+                                Some(color) if color == game.my_color => "You win!",
+                                Some(_) => "You lose",
+                                None => "Drawn game",
+                            };
+                            Some(text.to_string())
+                        }
+                        _ => None,
+                    },
                 };
                 let banner: Option<&str> = banner.as_deref();
 
@@ -1788,7 +1881,11 @@ impl ApplicationHandler<NetEvent> for App {
                     Mode::Live => self.live_board.as_ref().unwrap_or(&self.board),
                     Mode::Local => &self.board,
                     Mode::Play => match &self.online {
-                        Online::Active(game) => &game.board,
+                        OnlineState::Active(game)
+                        | OnlineState::Finished(game)
+                        | OnlineState::Failed {
+                            game: Some(game), ..
+                        } => &game.board,
                         _ => &self.board,
                     },
                 };
@@ -2014,85 +2111,113 @@ fn replay_uci(board: &mut VariantPosition, moves: &str) {
     }
 }
 
+/// Format an upstream error for the UI, masking the token in case a transport
+/// error ever includes request context. No caller builds messages with the
+/// token, but the helper makes that guarantee local and auditable.
+fn safe_error(context: &str, error: impl std::fmt::Display, token: &lichess::Token) -> String {
+    lichess::redact(&format!("{context}: {error}"), token.as_str())
+}
+
+/// Board API winner strings are `white` / `black`.
+fn winner_color(winner: Option<&str>) -> Option<Color> {
+    match winner {
+        Some(name) if name.eq_ignore_ascii_case("white") => Some(Color::White),
+        Some(name) if name.eq_ignore_ascii_case("black") => Some(Color::Black),
+        _ => None,
+    }
+}
+
 /// Long-running online play worker: validate the token, create the
 /// challenge, wait for acceptance, then stream the game to the event loop
-/// until it ends.
-fn online_worker(proxy: EventLoopProxy<NetEvent>, token: String, opponent: String) {
-    let me = match lichess::account_me(&token) {
+/// until it ends. Every failure is a safe, token-free message.
+fn online_worker(
+    proxy: EventLoopProxy<NetEvent>,
+    api: lichess::ApiClient,
+    token: lichess::Token,
+    request: lichess::ChallengeRequest,
+) {
+    let me = match api.account_me(&token) {
         Ok(me) => me,
         Err(e) => {
             let _ = proxy.send_event(NetEvent::OnlineFailed {
-                message: format!("Token check failed: {e}"),
+                message: safe_error("Token check failed", e, &token),
             });
             return;
         }
     };
-    let _ = proxy.send_event(NetEvent::OnlineReady { username: me.username });
+    let _ = proxy.send_event(NetEvent::OnlineAccount {
+        username: me.username,
+    });
 
-    // Unrated 3+2 through the Board API.
-    let challenge = match lichess::create_challenge(&token, &opponent, false, 180, 2, None) {
-        Ok(challenge) => challenge,
+    let opponent = request.username().to_string();
+    let mut challenge_id = None;
+    let outcome = api.create_challenge(&token, &request, |created| {
+        challenge_id = Some(created.id.clone());
+        log::info!(
+            "Challenge {} sent to {}; keeping it alive until answered",
+            created.id,
+            opponent
+        );
+        let _ = proxy.send_event(NetEvent::OnlineChallengeCreated {
+            challenge_id: created.id.clone(),
+        });
+    });
+    match outcome {
+        Ok(lichess::ChallengeOutcome::Accepted) => {}
+        Ok(lichess::ChallengeOutcome::Declined) => {
+            let _ = proxy.send_event(NetEvent::OnlineFailed {
+                message: format!("{opponent} declined the challenge"),
+            });
+            return;
+        }
+        Ok(lichess::ChallengeOutcome::Canceled) => {
+            let _ = proxy.send_event(NetEvent::OnlineFailed {
+                message: format!("Challenge to {opponent} was canceled or expired"),
+            });
+            return;
+        }
         Err(e) => {
             let _ = proxy.send_event(NetEvent::OnlineFailed {
-                message: format!("Could not challenge {opponent}: {e}"),
+                message: safe_error(&format!("Could not challenge {opponent}"), e, &token),
             });
             return;
         }
-    };
-    log::info!("Challenge {} sent to {}, streaming until accepted...", challenge.id, opponent);
+    }
 
-    // The game stream 404s until the opponent accepts; retry for a bit, then
-    // stream until (and only until) the game ends.
-    for _ in 0..90 {
-        let result = lichess::stream_board_game(&token, &challenge.id, |event| {
-            forward_board_event(&proxy, event)
+    // The invitation was accepted; the game stream can still 404 for a moment
+    // while the game is created, then it stays open until the game ends.
+    let Some(challenge_id) = challenge_id else {
+        let _ = proxy.send_event(NetEvent::OnlineFailed {
+            message: "The challenge was accepted without an id".to_string(),
         });
-        match result {
-            Ok(()) => return, // stream closed = game over
+        return;
+    };
+    for _ in 0..20 {
+        match api.stream_board_game(&token, &challenge_id, |event| {
+            forward_board_event(&proxy, event)
+        }) {
+            Ok(()) => return,
             Err(e) if e.is_not_found() => {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(Duration::from_millis(250));
             }
             Err(e) => {
                 let _ = proxy.send_event(NetEvent::OnlineFailed {
-                    message: format!("Game stream failed: {e}"),
+                    message: safe_error("Game stream failed", e, &token),
                 });
                 return;
             }
         }
     }
     let _ = proxy.send_event(NetEvent::OnlineFailed {
-        message: format!("{opponent} did not accept in time"),
+        message: "The game did not start after the challenge was accepted".to_string(),
     });
 }
 
 /// Map Board API stream events onto the app's event enum.
 fn forward_board_event(proxy: &EventLoopProxy<NetEvent>, event: lichess::BoardStreamEvent) {
-    let color_of = |name: &str| match name.to_ascii_lowercase().as_str() {
-        "white" => Some(Color::White),
-        "black" => Some(Color::Black),
-        _ => None,
-    };
     let send = match event {
-        lichess::BoardStreamEvent::Full(full) => Some(NetEvent::OnlineFull {
-            game_id: full.id,
-            initial_fen: full.initial_fen,
-            white_name: full.white.name,
-            white_rating: full.white.rating.unwrap_or(0),
-            black_name: full.black.name,
-            black_rating: full.black.rating.unwrap_or(0),
-            moves: full.state.moves,
-            wtime_ms: full.state.wtime,
-            btime_ms: full.state.btime,
-            status: full.state.status,
-            winner: full.state.winner.as_deref().and_then(color_of),
-        }),
-        lichess::BoardStreamEvent::State(state) => Some(NetEvent::OnlineState {
-            moves: state.moves,
-            wtime_ms: state.wtime,
-            btime_ms: state.btime,
-            status: state.status,
-            winner: state.winner.as_deref().and_then(color_of),
-        }),
+        lichess::BoardStreamEvent::Full(full) => Some(NetEvent::OnlineFull(full)),
+        lichess::BoardStreamEvent::State(state) => Some(NetEvent::OnlineState(state)),
         // Chat and opponent-gone notices are out of scope for now.
         lichess::BoardStreamEvent::Chat(_) | lichess::BoardStreamEvent::OpponentGone(_) => None,
     };
@@ -2167,9 +2292,9 @@ fn main() {
         mode: Mode::Live,
         cursor_pos: (0.0, 0.0),
         token: None,
+        api: lichess::ApiClient::new(),
         my_username: None,
-        online: Online::Idle,
-        online_error: None,
+        online: OnlineState::Idle,
         history: Vec::new(),
         explosion: None,
         config,
@@ -2196,9 +2321,9 @@ mod tests {
             mode: Mode::Local,
             cursor_pos: (0.0, 0.0),
             token: None,
+            api: lichess::ApiClient::new(),
             my_username: None,
-            online: Online::Idle,
-            online_error: None,
+            online: OnlineState::Idle,
             history: Vec::new(),
             explosion: None,
             config: config::Config::default(),
@@ -3379,7 +3504,7 @@ mod tests {
         let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         app.mode = Mode::Play;
         app.my_username = Some("me".to_string());
-        app.online = Online::Active(Box::new(OnlineGame {
+        app.online = OnlineState::Active(Box::new(OnlineGame {
             game_id: "test".to_string(),
             board: position_from_fen(
                 "standard",
@@ -3404,6 +3529,127 @@ mod tests {
         assert_eq!(bars[1].clock, "05:00 +14");
         assert!(bars[0].captured.is_empty());
         assert_eq!(bars[1].captured, vec![Role::Rook, Role::Queen]);
+    }
+
+    /// A `gameFull` frame with White = "me" and no moves yet.
+    fn online_full() -> lichess::GameFull {
+        lichess::GameFull {
+            id: "abcd1234".to_string(),
+            initial_fen: Some("startpos".to_string()),
+            white: lichess::BoardPlayer {
+                id: "me".to_string(),
+                name: "me".to_string(),
+                title: None,
+                rating: Some(1500),
+            },
+            black: lichess::BoardPlayer {
+                id: "them".to_string(),
+                name: "them".to_string(),
+                title: None,
+                rating: Some(1600),
+            },
+            clock: Some(lichess::BoardClock {
+                initial: 300_000,
+                increment: 2_000,
+            }),
+            state: lichess::GameState {
+                moves: String::new(),
+                wtime: 300_000,
+                btime: 300_000,
+                status: "started".to_string(),
+                winner: None,
+            },
+            rated: false,
+        }
+    }
+
+    fn online_state(moves: &str, status: &str, winner: Option<&str>) -> lichess::GameState {
+        lichess::GameState {
+            moves: moves.to_string(),
+            wtime: 299_000,
+            btime: 299_000,
+            status: status.to_string(),
+            winner: winner.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn online_challenge_moves_from_challenging_to_waiting() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.online = OnlineState::Challenging;
+        app.on_online_challenge_created("abcd1234".to_string());
+        assert!(matches!(
+            app.online,
+            OnlineState::WaitingAccept { ref challenge_id } if challenge_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn a_late_challenge_created_event_does_not_interrupt_an_active_game() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.on_online_challenge_created("abcd1234".to_string());
+        assert!(matches!(app.online, OnlineState::Active(_)));
+    }
+
+    #[test]
+    fn game_full_activates_the_game_with_my_colour() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+
+        let OnlineState::Active(game) = &app.online else {
+            panic!("expected Active, got a different state");
+        };
+        assert_eq!(game.my_color, Color::White);
+        assert_eq!(game.white_rating, 1500);
+        assert_eq!(game.black_name, "them");
+        assert_eq!(game.white_clock, 300.0);
+        assert!(!game.game_over);
+        assert_eq!(app.online_game().map(|g| g.game_id.as_str()), Some("abcd1234"));
+        assert!(app.can_select_piece(Color::White));
+        assert!(!app.can_select_piece(Color::Black));
+    }
+
+    #[test]
+    fn a_terminal_stream_state_finishes_the_game_and_keeps_the_board() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.on_online_state(online_state("e2e4 e7e5", "resign", Some("black")));
+
+        let OnlineState::Finished(game) = &app.online else {
+            panic!("expected Finished, got a different state");
+        };
+        assert!(game.game_over);
+        assert_eq!(game.winner, Some(Color::Black));
+        // The final position is still on screen and no longer playable.
+        assert_eq!(app.online_game().map(|g| g.game_id.as_str()), Some("abcd1234"));
+        assert!(!app.can_select_piece(Color::White));
+        assert!(app.active_board().is_none());
+    }
+
+    #[test]
+    fn failures_keep_the_last_board_but_stop_play() {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.on_online_failed("Game stream failed".to_string());
+
+        match &app.online {
+            OnlineState::Failed { message, game } => {
+                assert_eq!(message, "Game stream failed");
+                assert!(game.is_some());
+            }
+            _ => panic!("expected Failed"),
+        }
+        assert!(app.online_game().is_some());
+        assert!(!app.can_select_piece(Color::White));
     }
 
     #[test]

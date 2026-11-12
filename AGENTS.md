@@ -181,6 +181,32 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    Non-Unix platforms skip the POSIX bits with a debug log — Windows uses ACLs,
    not modes. No new dependencies: `std::fs` plus `std::os::unix::fs::PermissionsExt`
    behind `#[cfg(unix)]`.
+15. **Online play is a small explicit state machine over a pinned, validated
+   Board API client.** `lichess::ApiClient` is hard-wired to
+   `https://lichess.org` in production (the `with_base`/local constructor is
+   `#[cfg(test)]`) and keeps ureq's default TLS validation. It retries only
+   HTTP 429: three retries, exponential 250 ms → 500 ms → 1 s (capped at 5 s),
+   honouring the `Retry-After` header. The token is a `lichess::Token` newtype
+   whose `Debug`/`Display` print `[redacted]`; the only reader is
+   `LICHESS_API_TOKEN` or the 0600 file, and every worker error that can reach
+   the banner passes through `lichess::redact(message, token)`. Inputs are
+   validated before any request (username 2–30 ASCII alphanumeric/`_`/`-`,
+   clock limit 0/15/30/45/90 or a multiple of 60 up to 10 800 s, increment
+   0–60 s, game id 4–16 alphanumeric, UCI `e2e4`/`e7e8q`), and moves are
+   additionally checked by shakmaty before they are posted. Responses are
+   deserialized into typed structs: malformed JSON is `Error::Parse`, a
+   malformed NDJSON frame is skipped so it cannot kill a live game. Client
+   state is the explicit enum `Idle → Challenging → WaitingAccept → Active →
+   Finished`, with `Failed` reachable from any step (it keeps the last board
+   visible but unplayable). Challenge creation sets `keepAliveStream=true`, so
+   the POST is NDJSON: the first line is the challenge object and the stream
+   stays open (server pings every 15 s) until `{"done":…}` reports
+   accepted/declined/canceled. That both keeps the realtime challenge past
+   Lichess's 20 s unaccepted expiry and removes the old 404/`/show` polling
+   loop; a post-acceptance 404 is retried briefly while the game is created.
+   The endpoint contract (`gameFull`/`gameState` shapes) lives on
+   `lichess::api`. API tests run against a local `std::net::TcpListener`, so
+   the suite stays offline and needs no mock crate.
 
 ## Coding Conventions
 
@@ -197,9 +223,10 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
 cargo build && cargo test && cargo run
 ```
 
-App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `Esc` = close
-promotion menu. Pieces move by click-click or drag-and-drop (press a piece, drag to
-a legal target, release); a press/release without moving stays a plain click. In
+App behavior: opens on live Lichess TV. `P` = local play, `L` = live, `C` =
+online challenge (Board API), `Esc` = close promotion menu. Pieces move by
+click-click or drag-and-drop (press a piece, drag to a legal target, release); a
+press/release without moving stays a plain click. In
 Crazyhouse, clicking a pocket piece highlights its legal drops (click one, or drag
 the piece out and release there); dimmed pocket rows are display-only. Theming is
 driven by `~/.config/lichess-rs/config.toml` and applies live on save.
@@ -241,6 +268,11 @@ Completed:
   directory is created 0700; the token placeholder and default config are 0600
   (Unix); startup and hot-reload warn when either file is group/world-readable
   (`mode & 0o044`), never auto-fixing the user's mode
+- [x] **Online play Stage 1 — secure Board API client + state machine**: pinned
+  `https://lichess.org` client with a local-test constructor, `Token` redaction,
+  pre-flight validation, bounded 429 backoff, typed `thiserror` errors, and the
+  explicit `Idle/Challenging/WaitingAccept/Active/Finished/Failed` client enum
+  (the final board stays visible after a failure but is not playable)
 
 Known limitations:
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
@@ -259,12 +291,10 @@ Known limitations:
   (200 ms) and the 500 ms flash covers the capturer's disappearance.
 
 Next:
-- [ ] Finish playable online games. Scaffolding already in the client:
-  token auth (`~/.config/lichess-rs/token`, `Mode::Play`), challenge creation +
-  Board API game stream (`stream_board_game`), move posting (`play_board_move`),
-  UCI replay of the server move list via `replay_uci`. What remains is
-  challenge UX (opponent/clock/time-control setup), takebacks/claims, and the
-  swap from "echo the server" latency smoothing.
+- [ ] Online play Stage 2 — challenge panel (opponent, clock presets, colour)
+  and in-game Takeback / Draw / Resign buttons wired through the same state
+  machine. Stage 3 — optimistic move application with confirmation from the
+  stream and rollback on rejection.
 - [ ] Variant *play* beyond Crazyhouse drops (Atomic, Horde, three-check, …) —
   spectate-only today.
 

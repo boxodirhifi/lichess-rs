@@ -173,17 +173,20 @@ pub enum BoardStreamEvent {
     OpponentGone(OpponentGone),
 }
 
-/// A created challenge, as returned by `POST /api/challenge/{username}`.
+/// A created challenge, as returned by `POST /api/challenge/{username}` (the
+/// first NDJSON line when `keepAliveStream` is set).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChallengeCreated {
     pub id: String,
-    #[serde(default)]
-    pub status: Option<String>,
+    pub status: String,
     #[serde(default)]
     pub url: Option<String>,
 }
 
+/// The current status of a challenge (`GET /api/challenge/{id}/show`).
+/// `status` is one of `created`, `offline`, `canceled`, `declined`, `accepted`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ChallengeAccepted {
-    pub challenge: ChallengeCreated,
+pub struct ChallengeStatus {
+    pub id: String,
+    pub status: String,
 }
