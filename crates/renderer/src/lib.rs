@@ -173,8 +173,10 @@ pub struct Renderer {
 
 impl Renderer {
     /// Build the renderer with `pieces` as the initial SVG set; config
-    /// hot-reload swaps it later through [`Renderer::reload_pieces`].
-    pub async fn new(window: Arc<Window>, pieces: PieceSet) -> Self {
+    /// hot-reload swaps it later through [`Renderer::reload_pieces`]. Every
+    /// environment-dependent step fails with an actionable message instead of
+    /// panicking, so a headless box or a broken driver gets a readable error.
+    pub async fn new(window: Arc<Window>, pieces: PieceSet) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let safe_width = size.width.max(1);
         let safe_height = size.height.max(1);
@@ -183,32 +185,58 @@ impl Renderer {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
-        let surface = instance.create_surface(window.clone()).expect("Failed to create surface");
+        let surface = instance.create_surface(window.clone())
+            .map_err(|e| anyhow::anyhow!("could not create the window surface: {e}"))?;
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-        }).await.expect("Failed to find a suitable GPU adapter");
+        }).await.ok_or_else(|| anyhow::anyhow!(
+            "no compatible GPU adapter found; install a Vulkan/GL driver for your GPU"
+        ))?;
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance,
-        }, None).await.expect("Failed to create logical device");
+        }, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not create a GPU device: {e}"))?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats.iter()
+        // An empty capability list would index-panic below; report it as a
+        // driver problem the user can act on instead.
+        let surface_format = surface_caps
+            .formats
+            .iter()
             .find(|f| f.is_srgb())
+            .or_else(|| surface_caps.formats.first())
             .copied()
-            .unwrap_or(surface_caps.formats[0]);
+            .ok_or_else(|| anyhow::anyhow!("the GPU reports no surface texture formats"))?;
+
+        // Prefer vsync-backed Fifo when the driver offers it; the fallback is
+        // the driver's own first choice rather than an indexed pick that could
+        // be a tearing-only mode on some backends.
+        let present_mode = surface_caps
+            .present_modes
+            .iter()
+            .find(|m| **m == wgpu::PresentMode::Fifo)
+            .or_else(|| surface_caps.present_modes.first())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("the GPU reports no present modes"))?;
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("the GPU reports no alpha modes"))?;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: safe_width,
             height: safe_height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
+            present_mode,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -230,7 +258,7 @@ impl Renderer {
         );
         let text_pipeline = TextPipeline::new(&device, &queue, surface_format, safe_width as f32, safe_height as f32);
 
-        Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -241,7 +269,7 @@ impl Renderer {
             overlay_pipeline,
             piece_pipeline,
             text_pipeline,
-        }
+        })
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {

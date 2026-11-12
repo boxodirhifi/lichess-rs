@@ -2121,22 +2121,39 @@ impl App {
 impl ApplicationHandler<NetEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = platform::create_window_attrs();
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        let window = match event_loop.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(e) => {
+                log::error!("Could not create the window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
         let size = window.inner_size();
         let safe_w = size.width.max(1) as f32;
         let safe_h = size.height.max(1) as f32;
         self.ui.set_board_theme(self.config.board);
         self.ui.layout(safe_w, safe_h);
-        let rend = pollster::block_on(renderer::Renderer::new(
+        // A missing driver or an empty capability list makes the renderer
+        // fail with an actionable message; there is nothing to show without
+        // it, so the loop exits instead of running a black window.
+        match pollster::block_on(renderer::Renderer::new(
             window.clone(),
             self.config.pieces,
-        ));
-        self.window = Some(window);
-        self.renderer = Some(rend);
+        )) {
+            Ok(rend) => {
+                self.window = Some(window);
+                self.renderer = Some(rend);
 
-        // Request the very first frame
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+                // Request the very first frame
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            Err(e) => {
+                log::error!("Could not start the renderer: {e}");
+                event_loop.exit();
+            }
         }
     }
 
