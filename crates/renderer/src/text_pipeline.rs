@@ -58,7 +58,15 @@ pub struct TextPipeline {
     draw_count: u32,
 }
 
-fn load_font_bytes() -> Option<Vec<u8>> {
+/// The guaranteed fallback, compiled into the binary, so the text atlas
+/// can always be built even where the system-font paths below don't exist
+/// (other distro layouts, macOS, Windows). DejaVu Sans is redistributable -
+/// see assets/fonts/LICENSE.
+const FALLBACK_FONT: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+
+/// A system font, wherever the distro put it, as the preferred source; the
+/// embedded copy is the backstop so startup never dies on a missing font.
+fn load_font_bytes() -> Vec<u8> {
     let paths = [
         "/usr/share/fonts/gdouros-symbola/Symbola.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
@@ -70,17 +78,20 @@ fn load_font_bytes() -> Option<Vec<u8>> {
     for p in paths {
         if let Ok(bytes) = std::fs::read(p) {
             log::info!("Loaded font from {}", p);
-            return Some(bytes);
+            return bytes;
         }
     }
-    None
+    log::info!("No system font found; using the embedded DejaVu Sans fallback");
+    FALLBACK_FONT.to_vec()
 }
 
 impl TextPipeline {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, width: f32, height: f32) -> Self {
-        let font_bytes = load_font_bytes()
-            .expect("No font with chess glyphs found. Install a Unicode font or place one in assets/fonts/");
-        let font = FontRef::try_from_slice(&font_bytes).expect("Failed to parse font");
+        // Always succeeds: a system font is preferred, the embedded copy is
+        // the guarantee behind the return type.
+        let font_bytes = load_font_bytes();
+        let font = FontRef::try_from_slice(&font_bytes)
+            .expect("the chosen font is not a parseable TTF (corrupt file?)");
         let scale = PxScale::from(RASTER_HEIGHT);
         let scaled = font.as_scaled(scale);
 

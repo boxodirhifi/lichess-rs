@@ -21,3 +21,10 @@ Select the set in `~/.config/lichess-rs/config.toml`:
 [theme]
 pieces = "merida"
 ```
+
+# Fonts
+
+`fonts/DejaVuSans.ttf` is embedded as a fallback font for text rendering when no
+compatible system font is found at startup. It is licensed under the Bitstream Vera /
+DejaVu license (see `fonts/LICENSE`).
+
