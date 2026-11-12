@@ -11,7 +11,7 @@
 //!
 //! | Endpoint | Purpose |
 //! |---|---|
-//! | `GET /api/account/me` | validate a token, learn the account name |
+//! | `GET /api/account` | validate a token, learn the account name |
 //! | `POST /api/challenge/{username}` | create a challenge (form: `rated`, `clock.limit`, `clock.increment`, `color`, `keepAliveStream`); NDJSON: challenge object, then `{"done":…}` |
 //! | `GET /api/challenge/{id}/show` | challenge status: `created`, `offline`, `canceled`, `declined`, `accepted` |
 //! | `GET /api/board/game/{id}/stream` | NDJSON events: `gameFull`, `gameState`, `chatLine`, `opponentGone` |
@@ -85,6 +85,19 @@ impl Error {
     /// Whether this is a client-side validation failure (no request was sent).
     pub fn is_invalid_input(&self) -> bool {
         matches!(self, Error::InvalidInput { .. })
+    }
+
+    /// HTTP status for a response error, if the server answered. Transport
+    /// failures (DNS, TLS, timeouts) and locally generated errors return
+    /// `None`; rate limits are already summarized as [`Error::RateLimited`].
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Error::Http(e) => match e.as_ref() {
+                ureq::Error::Status(code, _) => Some(*code),
+                ureq::Error::Transport(_) => None,
+            },
+            _ => None,
+        }
     }
 }
 
@@ -414,7 +427,7 @@ impl ApiClient {
 
     /// Public profile of the token's account; cheap way to validate a token.
     pub fn account_me(&self, token: &Token) -> Result<Account, Error> {
-        self.get_json(token, "/api/account/me")
+        self.get_json(token, "/api/account")
     }
 
     /// Create a real-time challenge and keep it alive until the opponent
@@ -879,7 +892,7 @@ mod tests {
 
         let request = server.next_request();
         let first = request.lines().next().unwrap();
-        assert_eq!(first, "GET /api/account/me HTTP/1.1");
+        assert_eq!(first, "GET /api/account HTTP/1.1");
         assert_eq!(header(&request, "authorization"), Some("Bearer s3cret"));
     }
 
@@ -959,6 +972,16 @@ mod tests {
     }
 
     #[test]
+    fn http_status_is_exposed_for_ui_messages() {
+        let server = Server::start(vec![response("401 Unauthorized", "{}")]);
+        let client = ApiClient::for_local_test(server.base());
+        let error = client.account_me(&Token::new("s3cret")).unwrap_err();
+        assert_eq!(error.http_status(), Some(401));
+        assert!(!error.is_not_found());
+        assert!(!error.is_invalid_input());
+    }
+
+    #[test]
     fn malformed_json_is_a_typed_parse_error() {
         let server = Server::start(vec![response("200 OK", "{not json")]);
         let client = ApiClient::for_local_test(server.base());
@@ -996,7 +1019,7 @@ mod tests {
         let second = server.next_request();
         assert_eq!(
             second.lines().next().unwrap(),
-            "GET /api/account/me HTTP/1.1"
+            "GET /api/account HTTP/1.1"
         );
     }
 

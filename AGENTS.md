@@ -239,6 +239,16 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    emits `OnlineMoveRejected` and rolls back at once; if the stream later
    confirms the move anyway, normal tail replay re-advances and adds the SAN
    exactly once.
+18. **Online failures are short, readable, and never overflow.** The client's
+   `online_error` maps typed `lichess::Error`s to one-line user messages
+   (401 → token rejected / check the token file, 403 → missing `board:play`,
+   404 → not found, 429 → rate limited, 400/5xx/transport/parse → concise
+   fallbacks) while the redacted full detail goes to the log only.
+   `Token::new` also strips a pasted `Bearer ` prefix and matching quotes. The
+   renderer banner greedily wraps at 86% of the window width, shrinks from
+   `1.1 × square` (capped at 64 px) down to 16 px across at most four lines,
+   and ellipsizes the last line as a last resort, so even a long error stays
+   on screen; short game-over banners render exactly as before.
 
 ## Coding Conventions
 

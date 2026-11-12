@@ -82,7 +82,7 @@ pub enum TvStreamEvent {
     Fen(FenData),
 }
 
-/// The authenticated account, as returned by `GET /api/account/me`.
+/// The authenticated account, as returned by `GET /api/account`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Account {
     pub id: String,

@@ -1591,7 +1591,7 @@ impl App {
         let uci = mv.to_uci(CastlingMode::Standard).to_string();
         std::thread::spawn(move || {
             if let Err(e) = api.play_board_move(&token, &game_id, &uci) {
-                let message = safe_error("Move failed", e, &token);
+                let message = online_error("Move failed", &e, &token);
                 log::warn!("{message}");
                 let _ = proxy.send_event(NetEvent::OnlineMoveRejected { message });
             }
@@ -1646,7 +1646,7 @@ impl App {
                 ui::ControlKind::Resign => api.resign(&token, &game_id),
             };
             if let Err(e) = result {
-                let message = safe_error("Online control failed", e, &token);
+                let message = online_error("Online control failed", &e, &token);
                 log::warn!("{message}");
                 let _ = proxy.send_event(NetEvent::OnlineNotice { message });
             }
@@ -2619,11 +2619,38 @@ fn game_position(initial_fen: &str, moves: &[String]) -> VariantPosition {
     board
 }
 
-/// Format an upstream error for the UI, masking the token in case a transport
-/// error ever includes request context. No caller builds messages with the
-/// token, but the helper makes that guarantee local and auditable.
-fn safe_error(context: &str, error: impl std::fmt::Display, token: &lichess::Token) -> String {
-    lichess::redact(&format!("{context}: {error}"), token.as_str())
+/// Turn an upstream Board API error into a short, user-readable message. The
+/// full (redacted) detail still goes to the log, so debugging keeps the status
+/// and transport context without dumping it into the banner.
+fn online_error(context: &str, error: &lichess::Error, token: &lichess::Token) -> String {
+    let detail = lichess::redact(&format!("{context}: {error}"), token.as_str());
+    log::warn!("{detail}");
+
+    match error {
+        lichess::Error::InvalidInput { field, message } => format!("Invalid {field}: {message}"),
+        lichess::Error::RateLimited { retry_after } => match retry_after {
+            Some(delay) => format!("Lichess rate limit - retry in {} s", delay.as_secs().max(1)),
+            None => "Lichess rate limit - retry shortly".to_string(),
+        },
+        lichess::Error::Parse(_) | lichess::Error::Protocol(_) => {
+            "Lichess sent an unexpected response".to_string()
+        }
+        lichess::Error::Io(_) => "Network error - could not reach Lichess".to_string(),
+        lichess::Error::Http(_) => match error.http_status() {
+            Some(401) => {
+                "Lichess rejected the token - check ~/.config/lichess-rs/token".to_string()
+            }
+            Some(403) => {
+                "Token needs the board:play scope - create a new one on Lichess".to_string()
+            }
+            Some(404) => format!("{context} - not found on Lichess"),
+            Some(429) => "Lichess rate limit - retry shortly".to_string(),
+            Some(400) => "Lichess rejected the request".to_string(),
+            Some(status) if status >= 500 => "Lichess is having trouble - try again".to_string(),
+            Some(status) => format!("Lichess returned HTTP {status}"),
+            None => "Network error - could not reach Lichess".to_string(),
+        },
+    }
 }
 
 /// Board API winner strings are `white` / `black`.
@@ -2648,7 +2675,7 @@ fn online_worker(
         Ok(me) => me,
         Err(e) => {
             let _ = proxy.send_event(NetEvent::OnlineFailed {
-                message: safe_error("Token check failed", e, &token),
+                message: online_error("Token check failed", &e, &token),
             });
             return;
         }
@@ -2686,7 +2713,7 @@ fn online_worker(
         }
         Err(e) => {
             let _ = proxy.send_event(NetEvent::OnlineFailed {
-                message: safe_error(&format!("Could not challenge {opponent}"), e, &token),
+                message: online_error(&format!("Could not challenge {opponent}"), &e, &token),
             });
             return;
         }
@@ -2710,7 +2737,7 @@ fn online_worker(
             }
             Err(e) => {
                 let _ = proxy.send_event(NetEvent::OnlineFailed {
-                    message: safe_error("Game stream failed", e, &token),
+                    message: online_error("Game stream failed", &e, &token),
                 });
                 return;
             }
@@ -4461,6 +4488,34 @@ mod tests {
         let notice = app.online_notice.clone().expect("notice");
         assert!(!notice.contains("s3cret"), "{notice}");
         assert!(notice.contains("[redacted]"), "{notice}");
+    }
+
+    #[test]
+    fn online_errors_become_short_user_facing_messages() {
+        let token = lichess::Token::new("s3cret");
+
+        let invalid = lichess::Error::InvalidInput {
+            field: "username",
+            message: "must be 2-30 characters".into(),
+        };
+        assert_eq!(
+            online_error("Could not challenge bob", &invalid, &token),
+            "Invalid username: must be 2-30 characters"
+        );
+
+        let limited = lichess::Error::RateLimited {
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert_eq!(
+            online_error("Move failed", &limited, &token),
+            "Lichess rate limit - retry in 7 s"
+        );
+
+        let protocol = lichess::Error::Protocol("unknown outcome".into());
+        assert_eq!(
+            online_error("Game stream failed", &protocol, &token),
+            "Lichess sent an unexpected response"
+        );
     }
 
     #[test]

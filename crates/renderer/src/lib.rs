@@ -14,6 +14,101 @@ use piece_pipeline::PiecePipeline;
 use quad_pipeline::QuadPipeline;
 use text_pipeline::TextPipeline;
 
+/// Long banners (error messages, not just "You win!") are wrapped and shrunk
+/// so they always stay inside the window and remain readable.
+const BANNER_MAX_LINES: usize = 4;
+const BANNER_MIN_SIZE: f32 = 16.0;
+const BANNER_MAX_SIZE: f32 = 64.0;
+
+/// Greedy word wrap at `max_width`. A word longer than a whole line is broken
+/// by character, so a pasted URL or status string cannot overflow.
+fn wrap_banner(
+    text: &str,
+    max_width: f32,
+    size: f32,
+    measure: &mut impl FnMut(&str, f32) -> f32,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if measure(&candidate, size) <= max_width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if measure(word, size) <= max_width {
+            current = word.to_string();
+        } else {
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                let mut next = chunk.clone();
+                next.push(ch);
+                if measure(&next, size) > max_width && !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            current = chunk;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Cut `text` to whatever fits at `size`, always marking it with `...`.
+fn ellipsize(text: &str, max_width: f32, size: f32, measure: &mut impl FnMut(&str, f32) -> f32) -> String {
+    let suffix = "...";
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        candidate.push_str(suffix);
+        if measure(&candidate, size) > max_width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str(suffix);
+    out
+}
+
+/// Shrink until the wrapped text fits [`BANNER_MAX_LINES`], then truncate with
+/// an ellipsis as a last resort. Returns the lines and the font size used.
+fn fit_banner(
+    text: &str,
+    max_width: f32,
+    start_size: f32,
+    mut measure: impl FnMut(&str, f32) -> f32,
+) -> (Vec<String>, f32) {
+    let mut size = start_size.clamp(BANNER_MIN_SIZE, BANNER_MAX_SIZE);
+    loop {
+        let mut lines = wrap_banner(text, max_width, size, &mut measure);
+        if lines.len() <= BANNER_MAX_LINES {
+            return (lines, size);
+        }
+        if size <= BANNER_MIN_SIZE {
+            lines.truncate(BANNER_MAX_LINES);
+            if let Some(last) = lines.last_mut() {
+                *last = ellipsize(last, max_width, size, &mut measure);
+            }
+            return (lines, size);
+        }
+        size = (size - 2.0).max(BANNER_MIN_SIZE);
+    }
+}
+
 /// A single piece drawn at an arbitrary screen position (e.g. the promotion
 /// menu or a Crazyhouse pocket). Board pieces come from the position itself;
 /// both go through the same SVG-atlas textured-quad path.
@@ -192,19 +287,30 @@ impl Renderer {
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Convert the banner (if any) into a centered TextElement using window size.
+        // Convert the banner (if any) into centered TextElement(s) using window
+        // size. Long messages wrap and shrink to fit instead of running off
+        // both sides of the window.
         let mut all_texts: Vec<TextElement> = scene.texts.to_vec();
         if let Some(banner) = scene.banner {
-            let size = (scene.square_size * 1.1).max(28.0);
-            all_texts.push(TextElement {
-                text: banner.to_string(),
-                x: self.config.width as f32 / 2.0,
-                y: self.config.height as f32 / 2.0 + size * 0.35,
-                size,
-                color: [1.0, 1.0, 1.0, 1.0],
-                align: TextAlign::Center,
-                shadow: true,
+            let max_width = (self.config.width as f32 * 0.86).max(80.0);
+            let start = (scene.square_size * 1.1).max(28.0);
+            let (lines, size) = fit_banner(banner, max_width, start, |text, size| {
+                self.text_pipeline.text_width(text, size)
             });
+            let line_height = size * 1.2;
+            let block_height = line_height * (lines.len().saturating_sub(1)) as f32;
+            let first_y = self.config.height as f32 / 2.0 + size * 0.35 - block_height / 2.0;
+            for (index, line) in lines.into_iter().enumerate() {
+                all_texts.push(TextElement {
+                    text: line,
+                    x: self.config.width as f32 / 2.0,
+                    y: first_y + index as f32 * line_height,
+                    size,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    align: TextAlign::Center,
+                    shadow: true,
+                });
+            }
         }
 
         self.quad_pipeline.prepare(&self.queue, scene.quads);
@@ -247,3 +353,63 @@ impl Renderer {
         output.present();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic stand-in for the glyph advance table: every character is
+    /// 0.6 em wide.
+    fn monospace(text: &str, size: f32) -> f32 {
+        text.chars().count() as f32 * size * 0.6
+    }
+
+    #[test]
+    fn short_banner_stays_one_line_at_full_size() {
+        let (lines, size) = fit_banner("You win!", 500.0, 48.0, monospace);
+        assert_eq!(lines, vec!["You win!"]);
+        assert_eq!(size, 48.0);
+    }
+
+    #[test]
+    fn long_banner_wraps_without_overflow() {
+        let text = "Lichess rejected the token - check your API token";
+        let (lines, size) = fit_banner(text, 400.0, 48.0, monospace);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(
+                monospace(line, size) <= 400.0,
+                "{line:?} overflows at {size}"
+            );
+        }
+        assert_eq!(lines.join(" "), text);
+    }
+
+    #[test]
+    fn banner_shrinks_then_ellipsizes_to_four_lines() {
+        let text = vec!["x"; 400].join(" ");
+        let (lines, size) = fit_banner(&text, 400.0, 64.0, monospace);
+        assert!(size < 64.0);
+        assert_eq!(lines.len(), BANNER_MAX_LINES);
+        assert!(lines.last().unwrap().ends_with("..."));
+        for line in &lines {
+            assert!(
+                monospace(line, size) <= 400.0,
+                "{line:?} overflows at {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_word_is_hard_broken() {
+        let text = "a".repeat(100);
+        let (lines, size) = fit_banner(&text, 120.0, 20.0, monospace);
+        for line in &lines {
+            assert!(
+                monospace(line, size) <= 120.0,
+                "{line:?} overflows at {size}"
+            );
+        }
+    }
+}
+
