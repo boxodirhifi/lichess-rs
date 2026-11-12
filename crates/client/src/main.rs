@@ -643,7 +643,7 @@ impl App {
         self.challenge_error = if lichess::read_token().is_some() {
             None
         } else {
-            Some("No API token — set it in ~/.config/lichess-rs/token".to_string())
+            Some("No API token - set it in ~/.config/lichess-rs/token".to_string())
         };
         if self.challenge_opponent.is_empty() {
             if let Some(name) = read_opponent() {
@@ -686,7 +686,7 @@ impl App {
         // A test can seed `self.token`; production always reads the file/env.
         let Some(token) = self.token.clone().or_else(lichess::read_token) else {
             self.challenge_error =
-                Some("No API token — set it in ~/.config/lichess-rs/token".to_string());
+                Some("No API token - set it in ~/.config/lichess-rs/token".to_string());
             return;
         };
         self.token = Some(token.clone());
@@ -895,7 +895,7 @@ impl App {
             }
         }
         if rejected {
-            self.online_notice = Some("Move rejected — board restored".to_string());
+            self.online_notice = Some("Move rejected - board restored".to_string());
             log::warn!("Online move was not echoed by the server; rolled back");
         }
         if game_over {
@@ -1109,7 +1109,7 @@ impl App {
 
         let (status, color) = match &self.challenge_error {
             Some(message) => (message.as_str(), error),
-            None => ("Unrated · Enter to send · Esc to cancel", muted),
+            None => ("Unrated - Enter to send - Esc to cancel", muted),
         };
         texts.push(renderer::TextElement {
             text: status.to_string(),
@@ -1615,7 +1615,7 @@ impl App {
     }
 
     /// Send a takeback/draw offer or a resignation. The notice is optimistic
-    /// ("… sent"); the game stream reports the real outcome, and a transport
+    /// ("... sent"); the game stream reports the real outcome, and a transport
     /// failure replaces the notice with a redacted message.
     fn send_control(&mut self, kind: ui::ControlKind) {
         let Some(game) = self.online_game() else { return };
@@ -1624,7 +1624,7 @@ impl App {
         }
         let game_id = game.game_id.clone();
         let Some(token) = self.token.clone() else {
-            self.online_notice = Some("No API token — cannot send that".to_string());
+            self.online_notice = Some("No API token - cannot send that".to_string());
             return;
         };
         let api = self.api.clone();
@@ -1632,7 +1632,7 @@ impl App {
             match kind {
                 ui::ControlKind::Takeback => "Takeback offer sent",
                 ui::ControlKind::Draw => "Draw offer sent",
-                ui::ControlKind::Resign => "Resigning…",
+                ui::ControlKind::Resign => "Resigning...",
             }
             .to_string(),
         );
@@ -1708,7 +1708,7 @@ impl App {
             // Without a token there is nothing to post; leave the board and
             // history untouched rather than showing a move that never left.
             if self.token.is_none() {
-                self.online_notice = Some("No API token — cannot play that move".to_string());
+                self.online_notice = Some("No API token - cannot play that move".to_string());
                 return;
             }
             // Optimistic apply: the board advances now and the move is marked
@@ -2368,7 +2368,7 @@ impl ApplicationHandler<NetEvent> for App {
                     Mode::Play => match &self.online {
                         OnlineState::Failed { message, .. } => Some(message.clone()),
                         OnlineState::Challenging => {
-                            Some("Validating token and creating the challenge…".to_string())
+                            Some("Validating token and creating the challenge...".to_string())
                         }
                         OnlineState::WaitingAccept { .. } => {
                             Some("Challenge sent - waiting for opponent to accept".to_string())
@@ -4083,6 +4083,63 @@ mod tests {
     }
 
     #[test]
+    fn every_rendered_string_lives_in_the_atlas() {
+        // The glyph atlas covers printable ASCII (32..=126) only: any other
+        // codepoint in a UI string renders as a gap. Walk the real
+        // text-building path through every statically-built string —
+        // coordinates, clocks, bars, history, control labels, notices,
+        // challenge panel and end-of-game banners.
+        fn assert_renderable(texts: &[renderer::TextElement]) {
+            for text in texts {
+                for c in text.text.chars() {
+                    assert!(
+                        (c as u32) >= 32 && (c as u32) <= 126,
+                        "unrenderable char {c:?} in {:#?}",
+                        text.text
+                    );
+                }
+            }
+        }
+
+        // Local board with a move in the history.
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let (x, y) = square_center(&app, Square::E2);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::E4);
+        app.handle_board_click(x, y);
+        // Spare width puts the move-history column on screen too.
+        app.ui.layout(1400.0, 600.0);
+        assert_renderable(&app.build_texts());
+
+        // A finished local game renders the end-of-game banner.
+        app.board = position_from_fen(
+            "standard",
+            "r1bqk1nr/pppp1Qpp/2n5/2b1p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4",
+        )
+        .expect("mate fen");
+        assert_renderable(&app.build_texts());
+
+        // Spectator mode renders player bars and clocks.
+        let spectator = app_with_live_game();
+        assert_renderable(&spectator.build_texts());
+
+        // An active online game renders the action row and its notices.
+        let mut online = app_in_online_game();
+        online.ui.set_controls_visible(true);
+        online.online_notice = Some("Move rejected - board restored".to_string());
+        assert_renderable(&online.build_texts());
+
+        // The challenge panel owns the whole text pass while open.
+        let mut challenger = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        challenger.open_challenge_panel();
+        challenger.challenge_opponent = "Some Name".to_string();
+        challenger.challenge_error = Some(
+            "No API token - set it in ~/.config/lichess-rs/token".to_string(),
+        );
+        assert_renderable(&challenger.build_texts());
+    }
+
+    #[test]
     fn locally_played_moves_become_the_last_move_highlight() {
         let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         let (x, y) = square_center(&app, Square::E2);
@@ -4568,7 +4625,7 @@ mod tests {
         assert_eq!(app.history, vec!["d4".to_string()]);
         assert_eq!(
             app.online_notice.as_deref(),
-            Some("Move rejected — board restored")
+            Some("Move rejected - board restored")
         );
     }
 
