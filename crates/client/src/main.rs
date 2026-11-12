@@ -881,20 +881,22 @@ impl App {
             game.winner = winner;
         }
 
-        if rollback_optimistic {
-            self.history.pop();
+        // The reconciled tail belongs to this online game: its SAN, last-move
+        // tint and blast belong to the Play view only, so a background stream
+        // never annotates the Local board or the TV screen either.
+        if self.mode == Mode::Play {
+            if rollback_optimistic {
+                self.history.pop();
+            }
+            self.history.extend(tail_history);
+            if let Some(last) = tail_last {
+                self.ui.set_last_move(Some(last));
+                self.explosion = tail_explosion;
+            }
         }
-        self.history.extend(tail_history);
         if rejected {
             self.online_notice = Some("Move rejected — board restored".to_string());
             log::warn!("Online move was not echoed by the server; rolled back");
-        }
-        if let Some(last) = tail_last {
-            self.ui.set_last_move(Some(last));
-            // Background streams must not animate another mode's game.
-            if self.mode == Mode::Play {
-                self.explosion = tail_explosion;
-            }
         }
         if game_over {
             let previous = std::mem::replace(&mut self.online, OnlineState::Idle);
@@ -922,14 +924,14 @@ impl App {
                 rolled_back = true;
             }
         }
-        if rolled_back {
+        // The rollback undoes Play-view state only; another mode's tint
+        // and history are not ours to pop or clear.
+        if rolled_back && self.mode == Mode::Play {
             self.history.pop();
             // The highlight referred to the optimistic move; nothing on the
             // restored board produced it.
             self.ui.set_last_move(None);
-            if self.mode == Mode::Play {
-                self.explosion = None;
-            }
+            self.explosion = None;
         }
         log::warn!("{message}");
         self.online_notice = Some(message);
@@ -1734,10 +1736,65 @@ impl App {
         }
     }
 
+    /// A new TV game was featured: the position and player info keep warming
+    /// in the background so switching to Live is instant, but the Live
+    /// view's tint, history and blast are cleared only while Live is on
+    /// screen — a featured-game rotation must not wipe a Local/Play game's
+    /// last-move tint or move history.
+    // The payload is the event variant's own fields, passed through whole.
+    #[allow(clippy::too_many_arguments)]
+    fn on_featured_game(
+        &mut self,
+        channel: String,
+        fen: String,
+        white_name: String,
+        white_rating: u32,
+        black_name: String,
+        black_rating: u32,
+        white_secs: u32,
+        black_secs: u32,
+    ) {
+        let board = match position_from_fen(&channel, &fen) {
+            Some(board) => Some(board),
+            None => {
+                log::warn!("Dropping unparseable TV fen: {fen}");
+                None
+            }
+        };
+        let side = board.as_ref().map(|board| board.turn()).unwrap_or(Color::White);
+        if let Some(board) = board {
+            self.live_board = Some(board);
+        }
+        if self.mode == Mode::Live {
+            // A new featured game starts with no previous move.
+            self.ui.set_last_move(None);
+            self.history.clear();
+            self.clear_explosion();
+        }
+        self.live_info = Some(LiveGameInfo {
+            white_name,
+            black_name,
+            white_rating,
+            black_rating,
+            white_clock: white_secs as f64,
+            black_clock: black_secs as f64,
+            side_to_move: side,
+            last_update: Instant::now(),
+            game_over: false,
+        });
+    }
+
     /// A new TV position arrived: derive the single move that produced it from
-    /// the previously displayed position and highlight it. When nothing matches
-    /// (a missed move, a new game), the highlight is cleared instead of wrong.
+    /// the previously displayed position and highlight it. TV keeps warming
+    /// `live_board` in every mode so switching to Live is instant, but the
+    /// derived tint, history and blast belong to the Live view only — a
+    /// background stream must never annotate a Local or Play board. When
+    /// nothing matches (a missed move, a new game), the highlight is cleared
+    /// instead of wrong.
     fn note_live_move(&mut self, board: &VariantPosition) {
+        if self.mode != Mode::Live {
+            return;
+        }
         match self
             .live_board
             .as_ref()
@@ -1749,15 +1806,11 @@ impl App {
                     .set_last_move(mv.from().map(|from| (from, move_destination(mv, prev))));
                 // Background TV keeps running in every mode; only the Live
                 // view may turn its captures into a blast.
-                if self.mode == Mode::Live {
-                    self.explosion = explosion_for(prev, board, mv);
-                }
+                self.explosion = explosion_for(prev, board, mv);
             }
             None => {
                 self.ui.set_last_move(None);
-                if self.mode == Mode::Live {
-                    self.explosion = None;
-                }
+                self.explosion = None;
             }
         }
     }
@@ -2043,34 +2096,7 @@ impl ApplicationHandler<NetEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NetEvent) {
         match event {
             NetEvent::FeaturedGame { channel, fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs } => {
-                let board = match position_from_fen(&channel, &fen) {
-                    Some(board) => Some(board),
-                    None => {
-                        log::warn!("Dropping unparseable TV fen: {}", fen);
-                        None
-                    }
-                };
-                let side = board.as_ref().map(|board| board.turn()).unwrap_or(Color::White);
-                if let Some(board) = board {
-                    self.live_board = Some(board);
-                }
-                // A new featured game starts with no previous move.
-                self.ui.set_last_move(None);
-                self.history.clear();
-                if self.mode == Mode::Live {
-                    self.clear_explosion();
-                }
-                self.live_info = Some(LiveGameInfo {
-                    white_name,
-                    black_name,
-                    white_rating,
-                    black_rating,
-                    white_clock: white_secs as f64,
-                    black_clock: black_secs as f64,
-                    side_to_move: side,
-                    last_update: Instant::now(),
-                    game_over: false,
-                });
+                self.on_featured_game(channel, fen, white_name, white_rating, black_name, black_rating, white_secs, black_secs);
             }
             NetEvent::FenUpdate { channel, fen, white_secs, black_secs } => {
                 let board = match position_from_fen(&channel, &fen) {
@@ -3961,6 +3987,99 @@ mod tests {
         assert_eq!(app.ui.last_move(), None);
         // The un-derived moves are not invented in the history either.
         assert_eq!(app.history, vec!["e4"]);
+    }
+
+    #[test]
+    fn background_tv_leaves_local_ui_untouched() {
+        // Regression: the TV stream keeps warming `live_board` in every mode.
+        // Its frames must never repaint a Local game's last-move tint or mix
+        // the TV game's SAN into the Local history.
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let (x, y) = square_center(&app, Square::E2);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::E4);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+        assert_eq!(app.history, vec!["e4"]);
+
+        // A background TV frame from a different game arrives.
+        let prev = position_from_fen("atomic", "4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1")
+            .expect("atomic fen");
+        let mv = find_move(&prev, Square::E4, Square::D5);
+        let mut next = prev.clone();
+        next.play_unchecked(mv);
+        app.live_board = Some(prev);
+        app.note_live_move(&next);
+
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+        assert_eq!(app.history, vec!["e4"]);
+        assert!(app.explosion.is_none());
+    }
+
+    #[test]
+    fn featured_game_clear_reaches_only_the_live_view() {
+        // Regression: a featured-game rotation clears the Live view, but must
+        // not wipe a Local game's tint and history.
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let (x, y) = square_center(&app, Square::E2);
+        app.handle_board_click(x, y);
+        let (x, y) = square_center(&app, Square::E4);
+        app.handle_board_click(x, y);
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+        assert_eq!(app.history, vec!["e4"]);
+
+        app.on_featured_game(
+            "best".to_string(),
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b e3 0 1".to_string(),
+            "Anish".to_string(),
+            2700,
+            "Nakamura".to_string(),
+            2800,
+            600,
+            600,
+        );
+        assert_eq!(app.ui.last_move(), Some((Square::E2, Square::E4)));
+        assert_eq!(app.history, vec!["e4"]);
+
+        // The same event with Live on screen resets the view.
+        app.mode = Mode::Live;
+        app.on_featured_game(
+            "atomic".to_string(),
+            "r2k1b1r/pp3Bp1/2p2p2/4p2p/3PP3/2P2P2/PP4P1/R4K2 b - - 0 15".to_string(),
+            "Anish".to_string(),
+            2700,
+            "Nakamura".to_string(),
+            2800,
+            600,
+            600,
+        );
+        assert_eq!(app.ui.last_move(), None);
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn background_online_stream_leaves_local_ui_untouched() {
+        // Regression: an active online game keeps streaming in the background;
+        // its reconciled tail belongs to the Play view only — it must not
+        // annotate the Local board, its tint, or its history.
+        let mut app = app_in_online_game();
+        app.mode = Mode::Local;
+        app.history.push("d4".to_string());
+        app.ui.set_last_move(Some((Square::D2, Square::D4)));
+
+        // The server advances two plies while we watch the Local board.
+        app.on_online_state(online_state("e2e4 e7e5", "started", None));
+
+        assert_eq!(
+            app.active_board_ref()
+                .expect("local board")
+                .board()
+                .piece_at(Square::E4),
+            None,
+            "the online tail never touches the local board, only its own state"
+        );
+        assert_eq!(app.ui.last_move(), Some((Square::D2, Square::D4)));
+        assert_eq!(app.history, vec!["d4"]);
     }
 
     #[test]
