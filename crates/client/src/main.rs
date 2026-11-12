@@ -55,6 +55,11 @@ pub enum NetEvent {
     OnlineFailed {
         message: String,
     },
+    /// A played move could not be sent or was not accepted; roll the optimistic
+    /// board back to the last server position.
+    OnlineMoveRejected {
+        message: String,
+    },
     /// A non-fatal action result (takeback/draw offer sent, or a safe error).
     OnlineNotice {
         message: String,
@@ -74,7 +79,19 @@ enum Mode {
 /// An online game in progress.
 struct OnlineGame {
     game_id: String,
+    /// Initial position as sent by `gameFull` (`"startpos"` or a FEN); the
+    /// authoritative board is always rebuilt from this plus the whole move
+    /// list, so a missed frame cannot leave a stale position behind.
+    initial_fen: String,
+    /// What the player sees: the server board plus, while a move is in flight,
+    /// the optimistic local move.
     board: VariantPosition,
+    /// The last position the server confirmed.
+    server_board: VariantPosition,
+    /// UCI tokens from the last stream frame.
+    server_moves: Vec<String>,
+    /// Our move that has not been confirmed yet.
+    pending: Option<PendingMove>,
     my_color: Color,
     white_name: String,
     black_name: String,
@@ -85,6 +102,13 @@ struct OnlineGame {
     last_update: Instant,
     game_over: bool,
     winner: Option<Color>,
+}
+
+/// A move applied optimistically: its UCI spelling and the move-list index it
+/// must occupy once the server echoes it.
+struct PendingMove {
+    uci: String,
+    index: usize,
 }
 
 enum OnlineState {
@@ -372,6 +396,7 @@ fn derive_played_move(prev: &VariantPosition, next: &VariantPosition) -> Option<
     None
 }
 
+#[cfg(test)]
 fn derive_last_move(prev: &VariantPosition, next: &VariantPosition) -> Option<(Square, Square)> {
     let mv = derive_played_move(prev, next)?;
     // Variant-only moves (Crazyhouse drops) have no origin square.
@@ -747,11 +772,9 @@ impl App {
         } else {
             Color::Black
         };
-        let mut board = match full.initial_fen.as_deref().unwrap_or("startpos") {
-            "startpos" => VariantPosition::default(),
-            fen => position_from_fen("standard", fen).unwrap_or_default(),
-        };
-        replay_uci(&mut board, &full.state.moves);
+        let initial_fen = full.initial_fen.unwrap_or_else(|| "startpos".to_string());
+        let server_moves = split_moves(&full.state.moves);
+        let server_board = game_position(&initial_fen, &server_moves);
         // A fresh online game starts without a last-move highlight or notices.
         self.ui.set_last_move(None);
         self.history.clear();
@@ -760,7 +783,11 @@ impl App {
         let game_over = full.state.status != "started";
         let game = Box::new(OnlineGame {
             game_id: full.id,
-            board,
+            initial_fen,
+            board: server_board.clone(),
+            server_board,
+            server_moves,
+            pending: None,
             my_color,
             white_name: full.white.name,
             black_name: full.black.name,
@@ -779,33 +806,94 @@ impl App {
         };
     }
 
-    /// `gameState`: the server echoes the whole move list, so only the unseen
-    /// tail advances the board. A terminal status moves the game to `Finished`
-    /// while keeping the final position visible.
+    /// `gameState`: reconcile the optimistic board with the authoritative move
+    /// list. Our move is confirmed when the server echoes the same UCI token
+    /// at the index it was played; if the server skipped it (a rejection) the
+    /// board rolls back to the last server position. Unconfirmed states keep
+    /// the optimistic board on screen, so play never waits for a round trip.
     fn on_online_state(&mut self, state: lichess::GameState) {
-        let mut advanced = None;
         let game_over = state.status != "started";
+        let winner = winner_color(state.winner.as_deref());
+        let new_moves = split_moves(&state.moves);
+        let mut tail_history = Vec::new();
+        let mut tail_last = None;
+        let mut tail_explosion = None;
+        let mut rollback_optimistic = false;
+        let mut rejected = false;
+        let mut accepted = false;
+
         if let OnlineState::Active(game) = &mut self.online {
-            let prev = game.board.clone();
-            replay_uci(&mut game.board, &state.moves);
-            if prev.board() != game.board.board() {
-                let played = derive_played_move(&prev, &game.board);
-                advanced = Some((
-                    derive_last_move(&prev, &game.board),
-                    played.and_then(|mv| explosion_for(&prev, &game.board, mv)),
-                ));
+            let mut tail_start = game.server_moves.len().min(new_moves.len());
+            if let Some(pending) = game.pending.take() {
+                if new_moves.get(pending.index) == Some(&pending.uci) {
+                    // Confirmed: the optimistic SAN is already in history.
+                    accepted = true;
+                    tail_start = (pending.index + 1).min(new_moves.len());
+                } else if new_moves.len() <= pending.index {
+                    // The stream has not caught up yet: keep showing the move.
+                    game.pending = Some(pending);
+                    tail_start = new_moves.len();
+                } else {
+                    // The server moved past our index with a different move.
+                    rejected = true;
+                    rollback_optimistic = true;
+                    tail_start = pending.index.min(new_moves.len());
+                }
+            }
+
+            // Replay only the unseen tail on the old authoritative board, so
+            // every new ply contributes exactly one SAN entry and the final
+            // one drives the last-move highlight and Atomic blast. On
+            // confirmation the optimistic board already contains our move,
+            // so the tail starts after it.
+            let mut cursor = if accepted {
+                game.board.clone()
+            } else {
+                game.server_board.clone()
+            };
+            for uci in &new_moves[tail_start..] {
+                let Ok(parsed) = UciMove::from_ascii(uci.as_bytes()) else {
+                    log::warn!("UCI replay stopped at {uci}");
+                    break;
+                };
+                let Ok(mv) = parsed.to_move(&cursor) else {
+                    log::warn!("UCI replay stopped at {uci}");
+                    break;
+                };
+                tail_history.push(San::from_move(&cursor, mv).to_string());
+                let prev = cursor.clone();
+                cursor.play_unchecked(mv);
+                tail_last = mv.from().map(|from| (from, move_destination(mv, &prev)));
+                tail_explosion = explosion_for(&prev, &cursor, mv);
+            }
+
+            game.server_moves = new_moves;
+            game.server_board = game_position(&game.initial_fen, &game.server_moves);
+            // An unconfirmed pending move keeps `board` optimistic; otherwise
+            // the authoritative position wins (including the rollback case).
+            if game.pending.is_none() {
+                game.board = game.server_board.clone();
             }
             game.white_clock = state.wtime as f64 / 1000.0;
             game.black_clock = state.btime as f64 / 1000.0;
             game.last_update = Instant::now();
             game.game_over = game_over;
-            game.winner = winner_color(state.winner.as_deref());
+            game.winner = winner;
         }
-        if let Some((last, explosion)) = advanced {
-            self.ui.set_last_move(last);
+
+        if rollback_optimistic {
+            self.history.pop();
+        }
+        self.history.extend(tail_history);
+        if rejected {
+            self.online_notice = Some("Move rejected — board restored".to_string());
+            log::warn!("Online move was not echoed by the server; rolled back");
+        }
+        if let Some(last) = tail_last {
+            self.ui.set_last_move(Some(last));
             // Background streams must not animate another mode's game.
             if self.mode == Mode::Play {
-                self.explosion = explosion;
+                self.explosion = tail_explosion;
             }
         }
         if game_over {
@@ -816,6 +904,35 @@ impl App {
                 self.online = previous;
             }
         }
+    }
+
+    /// The HTTP layer could not deliver a move (or Lichess refused it). Roll
+    /// the optimistic board back immediately; if the stream later turns out to
+    /// have accepted the move anyway, normal reconciliation re-advances and
+    /// re-adds the SAN exactly once.
+    fn on_online_move_rejected(&mut self, message: String) {
+        let message = match &self.token {
+            Some(token) => lichess::redact(&message, token.as_str()),
+            None => message,
+        };
+        let mut rolled_back = false;
+        if let OnlineState::Active(game) = &mut self.online {
+            if game.pending.take().is_some() {
+                game.board = game.server_board.clone();
+                rolled_back = true;
+            }
+        }
+        if rolled_back {
+            self.history.pop();
+            // The highlight referred to the optimistic move; nothing on the
+            // restored board produced it.
+            self.ui.set_last_move(None);
+            if self.mode == Mode::Play {
+                self.explosion = None;
+            }
+        }
+        log::warn!("{message}");
+        self.online_notice = Some(message);
     }
 
     /// Any worker error lands here. The last board stays visible when one
@@ -1460,20 +1577,23 @@ impl App {
         }
     }
 
-    /// Post a played move to Lichess in the background; the board stream
-    /// echoes it back, so the reply only needs logging.
+    /// Post a played move to Lichess in the background. The board already
+    /// advanced optimistically; the stream confirms (or a failure rolls back).
     fn post_online_move(&mut self, mv: Move) {
         let game_id = self.online_game().map(|game| game.game_id.clone());
         let Some(game_id) = game_id else { return };
         let Some(token) = self.token.clone() else { return };
+        // Unit tests have no event loop and must never hit the network.
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
         let api = self.api.clone();
         let uci = mv.to_uci(CastlingMode::Standard).to_string();
         std::thread::spawn(move || {
             if let Err(e) = api.play_board_move(&token, &game_id, &uci) {
-                log::warn!(
-                    "Move post failed: {}",
-                    safe_error("move", e, &token)
-                );
+                let message = safe_error("Move failed", e, &token);
+                log::warn!("{message}");
+                let _ = proxy.send_event(NetEvent::OnlineMoveRejected { message });
             }
         });
     }
@@ -1583,6 +1703,20 @@ impl App {
             self.explosion =
                 atomic_prev.and_then(|prev| explosion_for(&prev, &self.board, mv));
         } else {
+            // Without a token there is nothing to post; leave the board and
+            // history untouched rather than showing a move that never left.
+            if self.token.is_none() {
+                self.online_notice = Some("No API token — cannot play that move".to_string());
+                return;
+            }
+            // Optimistic apply: the board advances now and the move is marked
+            // pending until the server echoes it (or a rollback arrives).
+            if let Some(game) = self.online.active_mut() {
+                let uci = mv.to_uci(CastlingMode::Standard).to_string();
+                let index = game.server_moves.len();
+                game.board.play_unchecked(mv);
+                game.pending = Some(PendingMove { uci, index });
+            }
             self.post_online_move(mv);
         }
         if let Some(san) = san {
@@ -1974,6 +2108,7 @@ impl ApplicationHandler<NetEvent> for App {
             NetEvent::OnlineFull(full) => self.on_online_full(*full),
             NetEvent::OnlineState(state) => self.on_online_state(state),
             NetEvent::OnlineFailed { message } => self.on_online_failed(message),
+            NetEvent::OnlineMoveRejected { message } => self.on_online_move_rejected(message),
             NetEvent::OnlineNotice { message } => {
                 // Worker messages are already redacted; re-apply locally so a
                 // future caller cannot leak the token into the notice line.
@@ -2444,20 +2579,44 @@ fn read_opponent() -> Option<String> {
 
 /// Replay a full UCI move list (as the Board API stream sends it) onto a
 /// board, using the board's own side-to-move tracking.
+#[cfg(test)]
 fn replay_uci(board: &mut VariantPosition, moves: &str) {
-    for uci in moves.split_whitespace() {
+    replay_tokens(board, &split_moves(moves));
+}
+
+/// Apply UCI tokens in order, stopping at the first unparsable or illegal one.
+fn replay_tokens(board: &mut VariantPosition, moves: &[String]) {
+    for uci in moves {
         let Ok(parsed) = UciMove::from_ascii(uci.as_bytes()) else {
-            log::warn!("UCI replay stopped at {}", uci);
+            log::warn!("UCI replay stopped at {uci}");
             break;
         };
         match parsed.to_move(board) {
             Ok(mv) => board.play_unchecked(mv),
             Err(_) => {
-                log::warn!("UCI replay stopped at {}", uci);
+                log::warn!("UCI replay stopped at {uci}");
                 break;
             }
         }
     }
+}
+
+/// Split a Board API move list into UCI tokens.
+fn split_moves(moves: &str) -> Vec<String> {
+    moves.split_whitespace().map(str::to_string).collect()
+}
+
+/// Rebuild the authoritative position from the initial FEN and the *whole*
+/// move list. Rebuilding beats incrementally patching the board: a duplicated
+/// or missed frame can never leave the server board in a state the server did
+/// not send.
+fn game_position(initial_fen: &str, moves: &[String]) -> VariantPosition {
+    let mut board = match initial_fen {
+        "startpos" => VariantPosition::default(),
+        fen => position_from_fen("standard", fen).unwrap_or_default(),
+    };
+    replay_tokens(&mut board, moves);
+    board
 }
 
 /// Format an upstream error for the UI, masking the token in case a transport
@@ -3861,11 +4020,19 @@ mod tests {
         app.my_username = Some("me".to_string());
         app.online = OnlineState::Active(Box::new(OnlineGame {
             game_id: "test".to_string(),
+            initial_fen: "rnb1kbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1".to_string(),
             board: position_from_fen(
                 "standard",
                 "rnb1kbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1",
             )
             .expect("capture fen"),
+            server_board: position_from_fen(
+                "standard",
+                "rnb1kbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1",
+            )
+            .expect("capture fen"),
+            server_moves: Vec::new(),
+            pending: None,
             my_color: Color::White,
             white_name: "me".to_string(),
             black_name: "them".to_string(),
@@ -4157,6 +4324,143 @@ mod tests {
         app.online_notice = None;
         app.send_control(ui::ControlKind::Resign);
         assert!(app.online_notice.is_none());
+    }
+
+    fn app_in_online_game() -> App {
+        let mut app = app_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        app.mode = Mode::Play;
+        app.my_username = Some("me".to_string());
+        app.on_online_full(online_full());
+        app.token = Some(lichess::Token::new("s3cret"));
+        app
+    }
+
+    #[test]
+    fn online_moves_apply_optimistically_and_confirm_without_double_applying() {
+        let mut app = app_in_online_game();
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+
+        // The board advances immediately; the server has not echoed it yet.
+        {
+            let game = app.online_game().expect("game");
+            assert!(game.board.board().piece_at(Square::E4).is_some());
+            assert!(game.board.board().piece_at(Square::E2).is_none());
+            assert_eq!(game.board.turn(), Color::Black);
+            assert!(game
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.uci == "e2e4" && pending.index == 0));
+            assert!(game.server_moves.is_empty());
+        }
+        assert_eq!(app.history, vec!["e4".to_string()]);
+
+        // A stale frame that does not yet contain the move keeps it on screen.
+        app.on_online_state(online_state("", "started", None));
+        {
+            let game = app.online_game().expect("game");
+            assert!(game.board.board().piece_at(Square::E4).is_some());
+            assert!(game.pending.is_some());
+        }
+        assert_eq!(app.history, vec!["e4".to_string()]);
+
+        // The echo confirms it; the board must not advance twice and the SAN
+        // must not be appended twice.
+        app.on_online_state(online_state("e2e4", "started", None));
+        {
+            let game = app.online_game().expect("game");
+            assert!(game.pending.is_none());
+            assert_eq!(game.server_moves, vec!["e2e4".to_string()]);
+            assert_eq!(game.board.turn(), Color::Black);
+            assert_eq!(game.board.board().piece_at(Square::E4).map(|p| p.role), Some(Role::Pawn));
+        }
+        assert_eq!(app.history, vec!["e4".to_string()]);
+
+        // A duplicated frame changes nothing.
+        app.on_online_state(online_state("e2e4", "started", None));
+        assert_eq!(app.history, vec!["e4".to_string()]);
+    }
+
+    #[test]
+    fn a_confirmed_move_with_a_reply_adds_each_san_once() {
+        let mut app = app_in_online_game();
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+        app.on_online_state(online_state("e2e4 e7e5", "started", None));
+
+        let game = app.online_game().expect("game");
+        assert!(game.pending.is_none());
+        assert_eq!(game.board.turn(), Color::White);
+        assert_eq!(app.history, vec!["e4".to_string(), "e5".to_string()]);
+    }
+
+    #[test]
+    fn a_rejected_move_rolls_the_board_and_history_back() {
+        let mut app = app_in_online_game();
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+
+        // The server moved past our index with a different move: the
+        // optimistic e4 never happened, so d4 is the real position.
+        app.on_online_state(online_state("d2d4", "started", None));
+        let game = app.online_game().expect("game");
+        assert!(game.pending.is_none());
+        assert!(game.board.board().piece_at(Square::E4).is_none());
+        assert!(game.board.board().piece_at(Square::D4).is_some());
+        assert_eq!(app.history, vec!["d4".to_string()]);
+        assert_eq!(
+            app.online_notice.as_deref(),
+            Some("Move rejected — board restored")
+        );
+    }
+
+    #[test]
+    fn a_failed_move_post_rolls_back_without_waiting_for_the_stream() {
+        let mut app = app_in_online_game();
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+        app.on_online_move_rejected("Move failed: socket closed".to_string());
+
+        let game = app.online_game().expect("game");
+        assert!(game.pending.is_none());
+        assert!(game.board.board().piece_at(Square::E2).is_some());
+        assert!(game.board.board().piece_at(Square::E4).is_none());
+        assert!(app.history.is_empty());
+        assert_eq!(
+            app.online_notice.as_deref(),
+            Some("Move failed: socket closed")
+        );
+    }
+
+    #[test]
+    fn move_failure_notices_never_contain_the_token() {
+        let mut app = app_in_online_game();
+        let mv = find_move(
+            app.active_board_ref().expect("active board"),
+            Square::E2,
+            Square::E4,
+        );
+        app.apply_move(mv);
+        app.on_online_move_rejected("Move failed: Bearer s3cret rejected".to_string());
+        let notice = app.online_notice.clone().expect("notice");
+        assert!(!notice.contains("s3cret"), "{notice}");
+        assert!(notice.contains("[redacted]"), "{notice}");
     }
 
     #[test]

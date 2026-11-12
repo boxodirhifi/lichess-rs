@@ -224,6 +224,21 @@ Dependency direction: `client` → {`renderer`, `ui`, `platform`, `lichess`};
    The row exists only in `OnlineState::Active` with `!game_over`; finished,
    failed and inactive states keep the final board but cannot send. `renderer`
    gained only the overlay pass (same sphere pipeline, no new dependency).
+17. **Online moves are optimistic and reconciled against the echoed move
+   list.** Play applies the move to `OnlineGame.board` immediately, records
+   `PendingMove { uci, index }` (index = plies already confirmed) and posts in
+   the background, so the piece never waits for a round trip. `OnlineGame`
+   keeps the initial FEN, the full `server_moves`, and a `server_board`
+   rebuilt from them on every frame: a duplicated or missed `gameState` can
+   never corrupt the authoritative position. Reconciliation confirms when
+   `moves[pending.index] == pending.uci` (adopt the server board and append
+   only the unseen tail, so SAN/highlight/blast are not duplicated), keeps
+   the optimistic board while the stream has not caught up, and rolls back to
+   `server_board` — popping the optimistic SAN and clearing the highlight —
+   when the server moved past that index with a different move. A failed POST
+   emits `OnlineMoveRejected` and rolls back at once; if the stream later
+   confirms the move anyway, normal tail replay re-advances and adds the SAN
+   exactly once.
 
 ## Coding Conventions
 
@@ -297,8 +312,16 @@ Completed:
   opponent/clock/colour panel (`C`), validated submission, an overlay quad pass
   so the panel covers the board, and Takeback / Draw / Resign buttons wired to
   `/api/board/game/{id}/{takeback/yes,draw/yes,resign}` with optimistic notices
+- [x] **Online play Stage 3 — optimistic moves + reconciliation**: local board
+  advance with `PendingMove`, authoritative rebuild from the echoed move list,
+  confirm-by-UCI, rollback on rejection/failed POST, and no duplicate SAN,
+  highlight or blast when frames are repeated or skipped
 
 Known limitations:
+- **A lost move POST response can make the piece blink.** If Lichess accepted
+  the move but the reply never reached us, `OnlineMoveRejected` rolls the board
+  back until the stream echoes the move and reconciliation re-advances it; the
+  final position and SAN count stay correct.
 - **No threefold-repetition tracking.** shakmaty positions are stateless (no move
   history), so a threefold draw can only be detected with a history tracker (e.g.
   a repetition hash per position). The 50-move banner *is* tracked via
@@ -315,8 +338,9 @@ Known limitations:
   (200 ms) and the 500 ms flash covers the capturer's disappearance.
 
 Next:
-- [ ] Online play Stage 3 — optimistic move application with confirmation from
-  the stream and rollback on rejection.
+- [ ] Online play polish — an explicit draw/takeback offer banner and
+  accept/decline handling from the stream (`gameState` currently only carries
+  the result), plus claim-victory / abort endpoints.
 - [ ] Variant *play* beyond Crazyhouse drops (Atomic, Horde, three-check, …) —
   spectate-only today.
 
